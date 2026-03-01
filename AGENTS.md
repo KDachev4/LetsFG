@@ -4,7 +4,7 @@
 
 ## What is BoostedTravel?
 
-BoostedTravel is an open-source, agent-native, CLI-native flight search and booking tool. Instead of burning tokens on browser automation, scraping, or building your own flight integration — just call `boostedtravel search` from the terminal or use the SDK/MCP tools.
+BoostedTravel is an agent-native, CLI-native flight search and booking tool. Instead of burning tokens on browser automation, scraping, or building your own flight integration — just call `boostedtravel search` from the terminal or use the SDK/MCP tools.
 
 It returns **real airline prices with zero price bias** — no demand-based inflation, no cookie tracking, no surge pricing. The same flight that costs $350 on a travel website is typically **$20–$50 cheaper** here because you're not paying for the brand of the website.
 

@@ -1,6 +1,6 @@
 # BoostedTravel
 
-Open-source, agent-native, CLI-native flight search & booking. Search 400+ airlines and book tickets straight from the terminal — no browser, no scraping, no token-burning automation. Built for AI agents and developers who need travel built into their workflow.
+Agent-native, CLI-native flight search & booking. Search 400+ airlines and book tickets straight from the terminal — no browser, no scraping, no token-burning automation. Built for AI agents and developers who need travel built into their workflow.
 
 **API Base URL:** `https://api.boostedchat.com`
 
@@ -12,7 +12,7 @@ Open-source, agent-native, CLI-native flight search & booking. Search 400+ airli
 
 AI agents need a native, CLI-based way to search and book flights, hotels, and travel experiences. Without it, agents either burn massive amounts of tokens on browser automation and scraping — or simply can't do it at all. That's unacceptable in situations where time and cost matter.
 
-BoostedTravel is an open-source interface to find flights and everything travel-related. One command, real results, real bookings.
+BoostedTravel is an agent-native interface to find flights and everything travel-related. One command, real results, real bookings.
 
 **You don't pay extra for the brand of a website.** Flight websites like Booking.com, Expedia, Google Flights, and Kayak inflate prices based on demand patterns, cookie tracking, browser fingerprinting, and surge pricing. The same flight that shows as $350 on those sites is often **$20–$50 cheaper** through BoostedTravel — because we return the raw airline price with zero markup or bias. Same flight, same airline, same seat — just cheaper.
 
