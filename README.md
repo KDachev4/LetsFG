@@ -16,13 +16,13 @@ BoostedTravel is an agent-native interface to find flights and everything travel
 
 **You don't pay extra for the brand of a website.** Flight websites like Booking.com, Expedia, Google Flights, and Kayak inflate prices based on demand patterns, cookie tracking, browser fingerprinting, and surge pricing. The same flight that shows as $350 on those sites is often **$20–$50 cheaper** through BoostedTravel — because we return the raw airline price with zero markup or bias. Same flight, same airline, same seat — just cheaper.
 
-## Pricing: Us vs. Flight Websites
+## Price: BoostedTravel vs. Flight Websites
 
 | | Google Flights / Booking.com / Expedia | **BoostedTravel** |
 |---|---|---|
 | Search flights | Free | **Free** |
-| View full offer details & price | Free (with tracking/inflation) | **$1 unlock** (flat fee, no tracking) |
-| Book flight | Ticket + website markup + surge pricing | **Just the ticket price** |
+| View full offer details & price | Free (with tracking/inflation) | **Free** (no tracking, no bias) |
+| Book flight (checkout) | Ticket + website markup + surge pricing | **$1 unlock + ticket price** (no markup) |
 | Price changes on repeat search? | Yes — goes up | **Never** |
 | Total extra cost | $20–$50+ hidden in inflated price | **$1 flat** |
 
