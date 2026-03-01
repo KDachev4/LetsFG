@@ -3,29 +3,17 @@ site_url: https://docs.boostedchat.com
 site_description: Agent-native flight search & booking API. 400+ airlines, straight from the terminal.
 site_author: Boosted Chat
 
-repo_name: Boosted-Chat/BoostedTravel
 repo_url: https://github.com/Boosted-Chat/BoostedTravel
 
 theme:
   name: material
   custom_dir: docs/overrides
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: deep purple
-      accent: amber
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: deep purple
-      accent: amber
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
+    scheme: slate
+    primary: teal
+    accent: teal
   font:
-    text: Inter
+    text: Lexend
     code: JetBrains Mono
   features:
     - navigation.instant
@@ -33,16 +21,12 @@ theme:
     - navigation.tabs
     - navigation.tabs.sticky
     - navigation.top
-    - navigation.indexes
     - content.code.copy
-    - content.code.annotate
     - search.highlight
     - search.suggest
     - toc.follow
   icon:
     repo: fontawesome/brands/github
-  logo: assets/logo.svg
-  favicon: assets/logo.svg
 
 nav:
   - Home: index.md
@@ -53,19 +37,12 @@ nav:
   - Packages: packages.md
 
 extra:
-  social:
-    - icon: fontawesome/brands/github
-      link: https://github.com/Boosted-Chat/BoostedTravel
-    - icon: fontawesome/brands/python
-      link: https://pypi.org/project/boostedtravel/
-    - icon: fontawesome/brands/npm
-      link: https://www.npmjs.com/package/boostedtravel
   generator: false
 
 extra_css:
   - assets/extra.css
 
-copyright: "&copy; 2026 Boosted Chat. MIT License."
+copyright: ""
 
 markdown_extensions:
   - admonition
@@ -79,9 +56,6 @@ markdown_extensions:
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.snippets
-  - pymdownx.emoji:
-      emoji_index: !!python/name:material.extensions.emoji.twemoji
-      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - attr_list
   - md_in_html
   - def_list
