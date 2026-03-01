@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "boostedtravel": {
+      "command": "python",
+      "args": ["-m", "api.mcp_server"],
+      "env": {
+        "BOOSTEDTRAVEL_URL": "https://api.boostedchat.com",
+        "BOOSTEDTRAVEL_API_KEY": "YOUR_API_KEY_HERE"
+      }
+    }
+  }
+}

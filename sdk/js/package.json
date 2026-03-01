@@ -1,0 +1,50 @@
+{
+  "name": "boostedtravel",
+  "version": "0.1.0",
+  "description": "Agent-native flight search & booking. 300+ airlines, cheaper than OTAs. Built for autonomous AI agents.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "boostedtravel": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts src/cli.ts --format cjs,esm --dts --clean",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "flights",
+    "travel",
+    "booking",
+    "agent",
+    "ai",
+    "cli",
+    "autonomous",
+    "mcp",
+    "openai",
+    "airline",
+    "ndc",
+    "search",
+    "ndc"
+  ],
+  "author": "BoostedTravel",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/boostedtravel/boostedtravel-js"
+  },
+  "homepage": "https://boostedchat.com",
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

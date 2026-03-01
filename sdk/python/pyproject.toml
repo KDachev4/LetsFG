@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "boostedtravel"
+version = "0.1.0"
+description = "Agent-native flight search & booking. 300+ airlines, cheaper than OTAs. Built for autonomous AI agents."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "BoostedTravel"},
+]
+keywords = [
+    "flights", "travel", "booking", "agent", "ai", "cli",
+    "autonomous", "mcp", "openai", "airline", "ndc",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+# ZERO mandatory dependencies — the SDK uses only stdlib (urllib)
+dependencies = []
+
+[project.optional-dependencies]
+cli = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+all = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+boostedtravel = "boostedtravel.cli:main"
+
+[project.urls]
+Homepage = "https://boostedchat.com"
+Documentation = "https://api.boostedchat.com/docs"
+Repository = "https://github.com/boostedtravel/boostedtravel-python"
+Issues = "https://github.com/boostedtravel/boostedtravel-python/issues"
+"API Reference" = "https://api.boostedchat.com/redoc"
+
+[tool.hatch.build.targets.wheel]
+packages = ["boostedtravel"]
