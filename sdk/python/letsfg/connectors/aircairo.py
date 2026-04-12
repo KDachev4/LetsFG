@@ -411,6 +411,7 @@ class AirCairoConnectorClient:
                 except (ValueError, TypeError):
                     pass
 
+            _sm_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
             seg = FlightSegment(
                 airline="SM",
                 airline_name="Air Cairo",
@@ -420,7 +421,7 @@ class AirCairoConnectorClient:
                 departure=dep_dt,
                 arrival=arr_dt,
                 duration_seconds=dur_sec,
-                cabin_class="economy",
+                cabin_class=_sm_cabin,
             )
             route = FlightRoute(segments=[seg], total_duration_seconds=dur_sec, stopovers=0)
 
@@ -494,11 +495,12 @@ class AirCairoConnectorClient:
                 continue
             seen.add(dedup_key)
 
+            _sm_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
             seg = FlightSegment(
                 airline="SM", airline_name="Air Cairo", flight_no=flight_no,
                 origin=req.origin, destination=req.destination,
                 departure=dep_dt, arrival=arr_dt, duration_seconds=dur_sec,
-                cabin_class="economy",
+                cabin_class=_sm_cabin,
             )
             route = FlightRoute(segments=[seg], total_duration_seconds=dur_sec, stopovers=0)
             fid = hashlib.md5(f"sm_{dedup_key}".encode()).hexdigest()[:12]

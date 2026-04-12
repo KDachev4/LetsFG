@@ -188,6 +188,7 @@ class AirBusanConnectorClient:
             except ValueError:
                 dep_dt = datetime(2000, 1, 1)
 
+            _bx_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
             seg = FlightSegment(
                 airline="BX",
                 airline_name="Air Busan",
@@ -197,7 +198,7 @@ class AirBusanConnectorClient:
                 departure=dep_dt,
                 arrival=dep_dt,
                 duration_seconds=0,
-                cabin_class="economy",
+                cabin_class=_bx_cabin,
             )
             route = FlightRoute(segments=[seg], total_duration_seconds=0, stopovers=0)
 

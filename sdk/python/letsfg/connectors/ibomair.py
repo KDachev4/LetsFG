@@ -234,6 +234,7 @@ class IbomAirConnectorClient:
 
             stops = int(flight.get("stops", flight.get("stopovers", 0)))
 
+            _qi_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
             seg = FlightSegment(
                 airline="QI",
                 airline_name="Ibom Air",
@@ -243,7 +244,7 @@ class IbomAirConnectorClient:
                 departure=dep_dt,
                 arrival=arr_dt,
                 duration_seconds=dur_sec,
-                cabin_class="economy",
+                cabin_class=_qi_cabin,
             )
             route = FlightRoute(
                 segments=[seg],

@@ -200,6 +200,7 @@ class SkymarkConnectorClient:
 
             duration = flight.get("duration", flight.get("durationMinutes", 0))
             dur_sec = int(duration) * 60 if duration and int(duration) < 1000 else int(duration or 0)
+            _bc_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
 
             seg = FlightSegment(
                 airline="BC",
@@ -210,7 +211,7 @@ class SkymarkConnectorClient:
                 departure=dep_dt,
                 arrival=dep_dt,
                 duration_seconds=dur_sec,
-                cabin_class="economy",
+                cabin_class=_bc_cabin,
             )
             route = FlightRoute(
                 segments=[seg],

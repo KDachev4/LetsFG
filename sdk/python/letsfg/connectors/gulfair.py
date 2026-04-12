@@ -176,6 +176,8 @@ class GulfAirConnectorClient:
         except (ValueError, TypeError):
             dep_dt = datetime(2000, 1, 1)
 
+        # Map cabin code to cabin name for segment
+        _gf_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
         seg = FlightSegment(
             airline="GF",
             airline_name="Gulf Air",
@@ -185,7 +187,7 @@ class GulfAirConnectorClient:
             departure=dep_dt,
             arrival=dep_dt,
             duration_seconds=0,
-            cabin_class="economy",
+            cabin_class=_gf_cabin,
         )
         route = FlightRoute(segments=[seg], total_duration_seconds=0, stopovers=0)
 
@@ -193,6 +195,8 @@ class GulfAirConnectorClient:
             f"gf_{origin}{dest}{dep_date}{price_f}".encode()
         ).hexdigest()[:12]
 
+        # Gulf Air cabin codes: Y=Economy, C=Business, F=First
+        _gf_cabin_url = {"M": "Y", "W": "Y", "C": "C", "F": "F"}.get(req.cabin_class or "M", "Y")
         return FlightOffer(
             id=f"gf_{fid}",
             price=price_f,
@@ -206,6 +210,7 @@ class GulfAirConnectorClient:
                 f"https://booking.gulfair.com/GF/dyn/air/booking/availability?"
                 f"from={req.origin}&to={req.destination}&outboundDate={dep_date}"
                 f"&ADT={req.adults or 1}&tripType={'RT' if req.return_from else 'OW'}"
+                f"&cabinClass={_gf_cabin_url}"
             ),
             is_locked=False,
             source="gulfair_direct",

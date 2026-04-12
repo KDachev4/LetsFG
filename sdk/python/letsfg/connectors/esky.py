@@ -360,7 +360,7 @@ class EskyConnectorClient:
             departure=dep_dt,
             arrival=arr_dt,
             duration_seconds=dur_sec,
-            cabin_class="economy",
+            cabin_class={"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy"),
         )
 
     async def _extract_from_dom(self, page, req: FlightSearchRequest, date_str: str) -> list[FlightOffer]:
@@ -465,13 +465,14 @@ class EskyConnectorClient:
                 continue
             seen.add(dedup_key)
 
+            _esky_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
             seg = FlightSegment(
                 airline="", airline_name=airline_name,
                 flight_no="",
                 origin=fd.get("origin") or req.origin,
                 destination=fd.get("destination") or req.destination,
                 departure=dep_dt, arrival=arr_dt,
-                duration_seconds=dur_sec, cabin_class="economy",
+                duration_seconds=dur_sec, cabin_class=_esky_cabin,
             )
             route = FlightRoute(segments=[seg], total_duration_seconds=dur_sec, stopovers=stops)
             fid = hashlib.md5(f"esky_{dedup_key}".encode()).hexdigest()[:12]
