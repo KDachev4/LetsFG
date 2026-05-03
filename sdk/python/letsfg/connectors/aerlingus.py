@@ -183,38 +183,45 @@ class AerLingusConnectorClient:
     async def _fetch_ancillaries(
         self, origin: str, dest: str, date_str: str, adults: int, currency: str
     ) -> dict | None:
-        from .ancillary_ref import get_ancillary_ref
-        ref = get_ancillary_ref("EI")
-        if not ref:
-            return None
-        cur = ref.get("currency", "EUR")
-        carry_on = ref.get("carry_on")
-        checked_bag = ref.get("checked_bag")
-        seat = ref.get("seat")
-        carry_on_note = ref.get("carry_on_note") or (
-            "1 cabin bag included" if carry_on == 0.0
-            else f"Carry-on add-on from ~{cur} {carry_on:.0f}" if carry_on is not None
-            else None
-        )
-        checked_note = ref.get("checked_bag_note") or (
-            "1 checked bag included" if checked_bag == 0.0
-            else f"First checked bag from ~{cur} {checked_bag:.0f}" if checked_bag is not None
-            else None
-        )
-        seat_note = (
-            "Seat selection included" if seat == 0.0
-            else f"Seat selection from ~{cur} {seat:.0f}" if seat is not None
-            else None
-        )
-        return {
-            "bags_from": carry_on,
-            "bags_note": carry_on_note,
-            "checked_bag_from": checked_bag,
-            "checked_bag_note": checked_note,
-            "seat_from": seat,
-            "seat_note": seat_note,
-            "currency": cur,
+        # For Economy Saver: 10 kg check-in bag is free; carry-on (overhead)
+        # costs a flat fee fetched live from aerlingus.com.
+        # Heavier add-on bags (20 kg €23, 25 kg €30, 40 kg €65) are available
+        # at checkout via /api/make/ancillary/essential (session-required).
+        cache_key = f"ei:carryonfee:{currency}"
+        now = time.monotonic()
+        if cache_key in _ancillary_cache:
+            ts, cached = _ancillary_cache[cache_key]
+            if now - ts < _ANCILLARY_CACHE_TTL:
+                return cached
+
+        carry_on_fee: float = 9.99  # published flat fee; used as fallback
+        try:
+            client = await self._client()
+            resp = await client.get(
+                f"{_BASE}/localized/components/fsr/carry-on-bag-fees.json",
+                headers={**_HEADERS, "Accept": "application/json"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                fees = resp.json()
+                carry_on_fee = float(fees.get(currency, fees.get("EUR", 9.99)))
+        except Exception as _e:
+            logger.debug("AerLingus carry-on fee fetch failed: %s", _e)
+
+        result: dict = {
+            "bags_from": carry_on_fee,
+            "bags_note": (
+                f"Cabin bag (10 kg overhead) from \u20ac{carry_on_fee:.2f}; "
+                "10 kg check-in bag free (Saver)"
+            ),
+            "checked_bag_from": 0.0,
+            "checked_bag_note": "10 kg check-in bag free (Saver); 20 kg from \u20ac23",
+            "seat_note": "Seat selection: add-on at checkout",
+            "currency": "EUR",
         }
+        _ancillary_cache[cache_key] = (now, result)
+        return result
+
     def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
         bags_note = ancillary.get("bags_note")
         seat_note = ancillary.get("seat_note")
@@ -229,10 +236,10 @@ class AerLingusConnectorClient:
                 offer.conditions["seat"] = seat_note
             if checked_bag_note:
                 offer.conditions["checked_bag"] = checked_bag_note
-            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
-                offer.bags_price["cabin_bag"] = bags_from
-            if checked_bag_from is not None and offer.currency.upper() == anc_currency.upper():
-                offer.bags_price["checked_bag"] = checked_bag_from
+            if bags_from is not None:
+                offer.bags_price.setdefault("carry_on", bags_from)
+            if checked_bag_from is not None:
+                offer.bags_price.setdefault("checked_bag", checked_bag_from)
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
         t0 = time.monotonic()
 
