@@ -190,12 +190,21 @@ class WingoConnectorClient:
 
     @staticmethod
     def _extract_fare_conditions(fare: dict) -> dict[str, str]:
-        conditions = {
-            "fare_upgrade_note": "Route page exposes base fare only; no baggage or seat pricing",
-        }
+        conditions: dict[str, str] = {}
         branded_fare = fare.get("brandedFareClass")
         if isinstance(branded_fare, str) and branded_fare.strip():
-            conditions["fare_family"] = branded_fare.strip()
+            fare_name = branded_fare.strip()
+            conditions["fare_family"] = fare_name
+            name_upper = fare_name.upper()
+            # Wingo fare families (Copa spin-off): LIGHT/BASIC=no bag, CLASSIC=1 bag, FLEX=2 bags
+            if any(k in name_upper for k in ("LIGHT", "BASIC", "BASE", "ZERO", "MINI")):
+                conditions["checked_bag"] = "no free checked bag"
+            elif any(k in name_upper for k in ("FLEX", "PLUS", "PREMIUM", "BUSINESS", "FULL")):
+                conditions["checked_bag"] = "2x 23kg bags included"
+            elif any(k in name_upper for k in ("CLASSIC", "ECONOMY", "STANDARD", "REGULAR")):
+                conditions["checked_bag"] = "1x 23kg bag included"
+        else:
+            conditions["fare_upgrade_note"] = "Route page exposes base fare only; no baggage or seat pricing"
         return conditions
 
     def _build_offers(self, fares: list[dict], req: FlightSearchRequest,

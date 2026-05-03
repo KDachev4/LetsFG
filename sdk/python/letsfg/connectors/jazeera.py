@@ -263,7 +263,12 @@ class JazeeraConnectorClient:
         currency = av.get("currencyCode", req.currency or "KWD")
 
         # Build fare price lookup: fareAvailabilityKey -> {amount, productClass}
+        # Also track cheapest price per productClass for bag add-on detection
         fare_lookup: dict[str, dict] = {}
+        _j9_class_price: dict[str, float] = {}  # productClass.upper() -> cheapest price
+        _J9_NO_BAG_CLASSES = {"light", "lite", "basic", "promo", "eco", "value"}
+        _J9_BAG_CLASSES = {"smart", "standard", "plus", "flexi", "flex", "comfort", "advantage", "plus"}
+        _J9_BAG_KG: dict[str, int] = {"smart": 20, "standard": 20, "flexi": 23, "flex": 23, "plus": 20, "comfort": 20, "advantage": 25}
         for fa_entry in av.get("faresAvailable", []):
             fak = fa_entry.get("key", "")
             val = fa_entry.get("value", {})
@@ -271,6 +276,7 @@ class JazeeraConnectorClient:
                 continue
             for fare in val.get("fares", []):
                 pc = fare.get("productClass", "")
+                pc_lower = pc.lower()
                 for pf in fare.get("passengerFares", []):
                     amount = pf.get("fareAmount")
                     if amount is not None and amount > 0:
@@ -281,6 +287,23 @@ class JazeeraConnectorClient:
                                 "publishedFare": pf.get("publishedFare", amount),
                                 "productClass": pc,
                             }
+                        # Track cheapest per class
+                        if pc_lower and (pc_lower not in _j9_class_price or amount < _j9_class_price[pc_lower]):
+                            _j9_class_price[pc_lower] = float(amount)
+
+        # Compute bag add-on from fare class prices
+        _j9_base: float | None = None
+        _j9_bag: float | None = None
+        _j9_bag_kg = 20
+        for cname, cprice in _j9_class_price.items():
+            if any(n in cname for n in _J9_NO_BAG_CLASSES):
+                if _j9_base is None or cprice < _j9_base:
+                    _j9_base = cprice
+            elif any(n in cname for n in _J9_BAG_CLASSES):
+                if _j9_bag is None or cprice < _j9_bag:
+                    _j9_bag = cprice
+                    _j9_bag_kg = _J9_BAG_KG.get(cname, 20)
+        _j9_add_on = round(_j9_bag - _j9_base, 2) if (_j9_base is not None and _j9_bag is not None) else None
 
         # Extract journeys — results[0] = outbound, results[1] = inbound (if RT)
         results = av.get("results", [])
@@ -473,6 +496,27 @@ class JazeeraConnectorClient:
             total_price = round(price + _ib_price, 2) if is_rt else price
             prefix = "j9_rt_" if is_rt else "j9_"
 
+            # ── Bag conditions from fare class ───────────────────────
+            _j9_offer_cond: dict[str, str] = {}
+            _j9_offer_bags: dict = {}
+            _best_class_lower = best_class.lower()
+            if any(n in _best_class_lower for n in _J9_NO_BAG_CLASSES):
+                _j9_offer_cond["checked_bag"] = "not included (Light fare)"
+                _j9_offer_cond["seat"] = "seat selection add-on from ~2 KWD"
+                if _j9_add_on is not None and _j9_add_on > 0:
+                    _j9_offer_bags["checked"] = _j9_add_on
+                    _j9_offer_cond["carry_on"] = (
+                        f"checked bag ({_j9_bag_kg} kg) from +{_j9_add_on:.2f} {currency}"
+                    )
+            elif any(n in _best_class_lower for n in _J9_BAG_CLASSES):
+                _j9_offer_cond["checked_bag"] = f"{_j9_bag_kg} kg included"
+                _j9_offer_cond["seat"] = "seat selection included"
+                _j9_offer_bags["checked"] = 0.0
+            elif "bus" in _best_class_lower or "business" in _best_class_lower:
+                _j9_offer_cond["checked_bag"] = "30 kg included"
+                _j9_offer_cond["seat"] = "seat selection included"
+                _j9_offer_bags["checked"] = 0.0
+
             offers.append(FlightOffer(
                 id=f"{prefix}{hashlib.md5(offer_key.encode()).hexdigest()[:12]}",
                 price=total_price,
@@ -482,6 +526,8 @@ class JazeeraConnectorClient:
                 inbound=_ib_route,
                 airlines=["Jazeera Airways"],
                 owner_airline="J9",
+                conditions=_j9_offer_cond,
+                bags_price=_j9_offer_bags,
                 booking_url=booking_url,
                 is_locked=False,
                 source="jazeera_direct",

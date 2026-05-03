@@ -38,6 +38,8 @@ from .browser import auto_block_if_proxied, get_default_proxy
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 _VIEWPORTS = [
     {"width": 1366, "height": 768},
     {"width": 1440, "height": 900},
@@ -400,7 +402,7 @@ class UnitedConnectorClient:
 
         airlines = list({s.airline_name for s in segments})
 
-        return FlightOffer(
+        offer = FlightOffer(
             id=offer_id,
             price=round(best_price, 2),
             currency="USD",
@@ -414,6 +416,11 @@ class UnitedConnectorClient:
             source="united_direct",
             source_tier="free",
         )
+        best_pt = (best_product or {}).get("productType", "")
+        if best_pt == "ECO-BASIC":
+            offer.bags_price["carry_on"] = 35.0
+            offer.conditions["carry_on"] = "Basic Economy: no free checked bag. First bag from $35"
+        return offer
 
     def _combine_rt(
         self,

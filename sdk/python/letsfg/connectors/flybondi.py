@@ -432,6 +432,7 @@ class FlybondiConnectorClient:
         )
 
         flight_key = f"FO{node.get('flightNo', '')}_{node.get('departureDate', '')}_{node.get('origin', '')}"
+        conditions, bags_price = self._extract_fo_bag_info(node, currency)
         return FlightOffer(
             id=f"fo_{hashlib.md5(flight_key.encode()).hexdigest()[:12]}",
             price=round(price, 2),
@@ -441,11 +442,89 @@ class FlybondiConnectorClient:
             inbound=None,
             airlines=["Flybondi"],
             owner_airline="FO",
+            conditions=conditions,
+            bags_price=bags_price,
             booking_url=booking_url,
             is_locked=False,
             source="flybondi_direct",
             source_tier="free",
         )
+
+    @staticmethod
+    def _extract_fo_bag_info(node: dict, currency: str) -> tuple[dict, dict]:
+        """Extract bag allowance from Flybondi GraphQL flight node fares."""
+        conditions: dict[str, str] = {}
+        bags_price: dict[str, float] = {}
+
+        fares = node.get("fares", [])
+        if not fares:
+            return conditions, bags_price
+
+        # Find STANDARD fare (same logic as _extract_best_price)
+        cheapest_fare: dict = {}
+        best_price = float("inf")
+        for fare in fares:
+            if not isinstance(fare, dict):
+                continue
+            fare_type = fare.get("type", "")
+            prices = fare.get("prices", {})
+            after_tax = prices.get("afterTax")
+            if after_tax is not None and fare_type == "STANDARD":
+                try:
+                    v = float(after_tax)
+                    if 0 < v < best_price:
+                        best_price = v
+                        cheapest_fare = fare
+                except (TypeError, ValueError):
+                    pass
+        if not cheapest_fare:
+            for fare in fares:
+                if not isinstance(fare, dict):
+                    continue
+                prices = fare.get("prices", {})
+                after_tax = prices.get("afterTax")
+                if after_tax is not None:
+                    try:
+                        v = float(after_tax)
+                        if 0 < v < best_price:
+                            best_price = v
+                            cheapest_fare = fare
+                    except (TypeError, ValueError):
+                        pass
+
+        if not cheapest_fare:
+            return conditions, bags_price
+
+        fare_name = str(cheapest_fare.get("type") or cheapest_fare.get("name") or "")
+        if fare_name:
+            conditions["fare_family"] = fare_name
+
+        # Try structured bag allowance from fare
+        bag_allow = (
+            cheapest_fare.get("baggageAllowance") or cheapest_fare.get("baggage")
+            or cheapest_fare.get("checkedBaggage") or {}
+        )
+        if isinstance(bag_allow, dict) and bag_allow:
+            qty = (
+                bag_allow.get("quantity") or bag_allow.get("pieces") or bag_allow.get("count")
+            )
+            if qty is not None:
+                try:
+                    qty_int = int(qty)
+                    if qty_int == 0:
+                        conditions["checked_bag"] = "no free checked bag"
+                    else:
+                        weight = bag_allow.get("weight") or bag_allow.get("maxWeight") or 23
+                        conditions["checked_bag"] = f"{qty_int}x {weight}kg bag included"
+                        bags_price["checked_bag"] = 0.0
+                except (TypeError, ValueError):
+                    pass
+
+        # Flybondi STANDARD base fare has no free checked bag (ultra-LCC)
+        if "checked_bag" not in conditions:
+            conditions["checked_bag"] = "no free checked bag (ultra-LCC fare)"
+
+        return conditions, bags_price
 
     @staticmethod
     def _extract_best_price(node: dict) -> Optional[float]:

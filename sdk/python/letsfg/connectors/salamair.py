@@ -260,6 +260,21 @@ class SalamAirConnectorClient:
         offers: list[FlightOffer] = []
         fares = flight.get("fares") or []
 
+        # ── Pre-compute fare price map for bag add-on calculation ──
+        _fare_price_map: dict[str, float] = {}
+        for _f in fares:
+            if not _f.get("available", False):
+                continue
+            _fname = (_f.get("fareTypeName") or "unknown").lower()
+            _total = sum(
+                float(fi.get("fareWithTaxes") or fi.get("baseFareWithTaxes") or 0)
+                for fi in (_f.get("fareInfos") or [])
+            )
+            if _total > 0 and _fname not in _fare_price_map:
+                _fare_price_map[_fname] = _total
+        _lite_price = _fare_price_map.get("lite")
+        _flexi_price = _fare_price_map.get("flexi")
+
         # Pick best fare per fare type
         for fare in fares:
             if not fare.get("available", False):
@@ -285,6 +300,27 @@ class SalamAirConnectorClient:
 
             offer_id = f"ov_{hashlib.md5(f'{flight_key}_{dep_str}_{fare_name}_{total_price}'.encode()).hexdigest()[:12]}"
 
+            # ── Bag conditions per fare type ──
+            _fn_lower = fare_name.lower()
+            _offer_cond: dict[str, str] = {"fare_type": fare_name}
+            _offer_bags: dict = {}
+            if _fn_lower == "lite":
+                _offer_cond["checked_bag"] = "not included (cabin bag only)"
+                _offer_cond["seat"] = "seat selection add-on available"
+                if _flexi_price is not None and _lite_price is not None:
+                    _add_on = round(_flexi_price - _lite_price, 2)
+                    if _add_on > 0:
+                        _offer_bags["checked"] = _add_on
+                        _offer_cond["carry_on"] = f"checked bag from +{_add_on:.2f} {currency}"
+            elif _fn_lower == "flexi":
+                _offer_cond["checked_bag"] = "20 kg included"
+                _offer_cond["seat"] = "seat selection add-on available"
+                _offer_bags["checked"] = 0.0
+            elif _fn_lower == "business":
+                _offer_cond["checked_bag"] = "30 kg included"
+                _offer_cond["seat"] = "seat selection included"
+                _offer_bags["checked"] = 0.0
+
             offers.append(FlightOffer(
                 id=offer_id,
                 price=total_price,
@@ -295,6 +331,8 @@ class SalamAirConnectorClient:
                 airlines=["SalamAir"],
                 owner_airline="OV",
                 availability_seats=seats_avail,
+                conditions=_offer_cond,
+                bags_price=_offer_bags,
                 booking_url=self._booking_url(req),
                 is_locked=False,
                 source="salamair_direct",

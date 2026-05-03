@@ -380,11 +380,29 @@ class YatraConnectorClient:
             logger.info("Yatra %s→%s: %d offers in %.1fs (CDP Chrome)", req.origin, req.destination, len(offers), elapsed)
 
             sh = hashlib.md5(f"yatra{req.origin}{req.destination}{date_str}{req.return_from or ''}".encode()).hexdigest()[:12]
-            return FlightSearchResponse(
+            ob_result = FlightSearchResponse(
                 search_id=f"fs_{sh}", origin=req.origin, destination=req.destination,
                 currency=offers[0].currency if offers else "INR",
                 offers=offers, total_results=len(offers),
             )
+
+            if ob_result.offers:
+                segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+                anc_origin = segs[0].origin if segs else req.origin
+                anc_dest = segs[-1].destination if segs else req.destination
+                try:
+                    ancillary = await asyncio.wait_for(
+                        self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                        timeout=45.0,
+                    )
+                    if ancillary:
+                        self._apply_ancillaries(ob_result.offers, ancillary)
+                except (asyncio.TimeoutError, TimeoutError):
+                    logger.debug("Ancillary fetch timed out for %s→%s", anc_origin, anc_dest)
+                except Exception as _anc_err:
+                    logger.debug("Ancillary fetch error for %s→%s: %s", anc_origin, anc_dest, _anc_err)
+
+            return ob_result
         except Exception as e:
             logger.error("Yatra CDP error: %s", e)
             return self._empty(req)
@@ -529,6 +547,24 @@ class YatraConnectorClient:
                     logger.debug("Yatra parse item error: %s", e)
 
         return offers
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        return None  # CDP Chrome connector does not expose fare bundle pricing
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:
         h = hashlib.md5(f"yatra{req.origin}{req.destination}{req.date_from}{req.return_from or ''}".encode()).hexdigest()[:12]

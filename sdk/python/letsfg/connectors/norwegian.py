@@ -56,6 +56,9 @@ from .browser import stealth_popen_kwargs, find_chrome, _launched_procs, get_cur
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
+
 _VIEWPORTS = [
     {"width": 1366, "height": 768},
     {"width": 1440, "height": 900},
@@ -200,8 +203,41 @@ class NorwegianConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
         return ob_result
 
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        """Live ancillary data is extracted inline in _parse_air_bounds."""
+        return None
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
         """
@@ -450,7 +486,7 @@ class NorwegianConnectorClient:
                 "isRequestedBound": True,
             })
         search_body = {
-            "commercialFareFamilies": ["DYSTD"],
+            "commercialFareFamilies": ["DYSTD", "DYSTDPLUS"],
             "itineraries": itineraries,
             "travelers": self._build_travelers(req),
             "searchPreferences": {"showSoldOut": True, "showMilesPrice": False},
@@ -651,40 +687,65 @@ class NorwegianConnectorClient:
                 stopovers=max(len(segments) - 1, 0),
             )
 
-            # Get cheapest fare (LOWFARE)
+            # Collect prices for LOWFARE and LOWFAREPLUS fare families
+            lowfare_price: float | None = None
+            lowfare_currency = "EUR"
+            lowfareplus_price: float | None = None
+
             for air_bound in group.get("airBounds", []):
-                if air_bound.get("fareFamilyCode", "") != "LOWFARE":
-                    continue
+                family_code = air_bound.get("fareFamilyCode", "")
                 total_prices = air_bound.get("prices", {}).get("totalPrices", [])
                 if not total_prices:
                     continue
                 price_obj = total_prices[0]
-                total_cents = price_obj.get("total", 0)
-                currency = price_obj.get("currencyCode", "EUR")
-                price = total_cents / 100.0
-                if price <= 0:
+                ab_cents = price_obj.get("total", 0)
+                ab_currency = price_obj.get("currencyCode", "EUR")
+                ab_price = ab_cents / 100.0
+                if ab_price <= 0:
                     continue
+                if family_code == "LOWFARE" and lowfare_price is None:
+                    lowfare_price = ab_price
+                    lowfare_currency = ab_currency
+                elif family_code in ("LOWFAREPLUS", "LOWPLUS", "STANDARD") and lowfareplus_price is None:
+                    lowfareplus_price = ab_price
 
-                # Classify direction by first segment origin
-                first_origin = segments[0].origin if segments else ""
-                if is_rt and first_origin == req.destination:
-                    inbound_groups.append((route, price, currency))
-                else:
-                    outbound_groups.append((route, price, currency))
-                break
+            if lowfare_price is None:
+                continue
+
+            price = lowfare_price
+            currency = lowfare_currency
+
+            # Compute checked-bag add-on cost from fare family price difference
+            checked_bag_price: float | None = None
+            if lowfareplus_price and lowfareplus_price > lowfare_price:
+                checked_bag_price = round(lowfareplus_price - lowfare_price, 2)
+
+            # Classify direction by first segment origin
+            first_origin = segments[0].origin if segments else ""
+            if is_rt and first_origin == req.destination:
+                inbound_groups.append((route, price, currency, checked_bag_price))
+            else:
+                outbound_groups.append((route, price, currency, checked_bag_price))
 
         # Build offers
         offers: list[FlightOffer] = []
 
+        def _make_conditions(bag_price: float | None, cur: str) -> dict:
+            conds: dict = {}
+            if bag_price is not None:
+                conds["checked_bag"] = f"1×20kg bag add-on from +{bag_price:.0f} {cur}"
+                conds["checked_bag_price"] = bag_price
+            return conds
+
         if is_rt and outbound_groups and inbound_groups:
             # Pair outbound × cheapest inbound, and vice versa
             inbound_groups.sort(key=lambda x: x[1])
-            for ob_route, ob_price, ob_cur in outbound_groups:
-                ib_route, ib_price, ib_cur = inbound_groups[0]
+            for ob_route, ob_price, ob_cur, ob_bag in outbound_groups:
+                ib_route, ib_price, ib_cur, ib_bag = inbound_groups[0]
                 total = round(ob_price + ib_price, 2)
                 currency = ob_cur
                 key = f"{ob_route.segments[0].flight_no}_{ib_route.segments[0].flight_no}_{total}"
-                offers.append(FlightOffer(
+                o = FlightOffer(
                     id=f"dy_{hashlib.md5(key.encode()).hexdigest()[:12]}",
                     price=total,
                     currency=currency,
@@ -697,11 +758,13 @@ class NorwegianConnectorClient:
                     is_locked=False,
                     source="norwegian_api",
                     source_tier="free",
-                ))
+                )
+                o.conditions.update(_make_conditions(ob_bag, ob_cur))
+                offers.append(o)
             # Also emit one-way outbound offers for combo engine
-            for ob_route, ob_price, ob_cur in outbound_groups:
+            for ob_route, ob_price, ob_cur, ob_bag in outbound_groups:
                 key = f"ow_{ob_route.segments[0].flight_no}_{ob_price}"
-                offers.append(FlightOffer(
+                o = FlightOffer(
                     id=f"dy_{hashlib.md5(key.encode()).hexdigest()[:12]}",
                     price=round(ob_price, 2),
                     currency=ob_cur,
@@ -714,12 +777,14 @@ class NorwegianConnectorClient:
                     is_locked=False,
                     source="norwegian_api",
                     source_tier="free",
-                ))
+                )
+                o.conditions.update(_make_conditions(ob_bag, ob_cur))
+                offers.append(o)
         else:
             # One-way search or no inbound results
-            for route, price, currency in outbound_groups:
+            for route, price, currency, bag_price in outbound_groups:
                 key = f"{route.segments[0].flight_no}_{price}"
-                offers.append(FlightOffer(
+                o = FlightOffer(
                     id=f"dy_{hashlib.md5(key.encode()).hexdigest()[:12]}",
                     price=round(price, 2),
                     currency=currency,
@@ -732,7 +797,9 @@ class NorwegianConnectorClient:
                     is_locked=False,
                     source="norwegian_api",
                     source_tier="free",
-                ))
+                )
+                o.conditions.update(_make_conditions(bag_price, currency))
+                offers.append(o)
 
         return offers
 

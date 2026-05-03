@@ -261,6 +261,10 @@ class FlyArystanConnectorClient:
 
             display_flight_no = "/".join(flight_no_parts)
 
+            # ── Bag pricing: PROMO = cabin bag only; REGULAR = 20 kg checked ──
+            promo_price = fares.get("PROMO")
+            regular_price = fares.get("REGULAR")
+
             for fare_brand, price in fares.items():
                 _fs_cabin = {"M": "economy", "W": "premium_economy", "C": "business", "F": "first"}.get(req.cabin_class or "M", "economy")
                 # Build segments
@@ -299,6 +303,23 @@ class FlyArystanConnectorClient:
                 offer_id = hashlib.md5(
                     f"flyarystan_{display_flight_no}_{fare_brand}_{price}".encode()
                 ).hexdigest()[:12]
+
+                # ── Bag conditions per fare brand ──
+                offer_conditions: dict[str, str] = {"fare_brand": fare_brand}
+                offer_bags_price: dict = {}
+                if fare_brand == "PROMO":
+                    offer_conditions["checked_bag"] = "not included (cabin bag only)"
+                    offer_conditions["seat"] = "seat selection add-on available"
+                    if regular_price is not None and promo_price is not None:
+                        add_on = round(regular_price - promo_price, 2)
+                        if add_on > 0:
+                            offer_bags_price["checked"] = add_on
+                            offer_conditions["carry_on"] = f"checked bag from +{add_on:,.0f} KZT"
+                elif fare_brand == "REGULAR":
+                    offer_conditions["checked_bag"] = "20 kg included"
+                    offer_conditions["seat"] = "seat selection included"
+                    offer_bags_price["checked"] = 0.0
+
                 offers.append(FlightOffer(
                     id=f"fs_{offer_id}",
                     price=round(price, 2),
@@ -308,7 +329,8 @@ class FlyArystanConnectorClient:
                     inbound=None,
                     airlines=["FlyArystan"],
                     owner_airline="FS",
-                    conditions={"fare_brand": fare_brand},
+                    conditions=offer_conditions,
+                    bags_price=offer_bags_price,
                     booking_url=booking_url,
                     is_locked=False,
                     source="flyarystan_direct",

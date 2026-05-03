@@ -202,6 +202,8 @@ class FlySafairConnectorClient:
                         inbound=rt["route"],
                         airlines=["FlySafair"],
                         owner_airline="FA",
+                        conditions=ob.get("conditions", {}),
+                        bags_price=ob.get("bags_price", {}),
                         booking_url=booking_url,
                         is_locked=False,
                         source="flysafair_direct",
@@ -219,6 +221,8 @@ class FlySafairConnectorClient:
                     inbound=None,
                     airlines=["FlySafair"],
                     owner_airline="FA",
+                    conditions=ob.get("conditions", {}),
+                    bags_price=ob.get("bags_price", {}),
                     booking_url=booking_url,
                     is_locked=False,
                     source="flysafair_direct",
@@ -250,6 +254,30 @@ class FlySafairConnectorClient:
         """Parse a single flight from the Sabre SearchShop response."""
         if flight.get("soldOut") or flight.get("soldout"):
             return None
+
+        # ── Build fare-type price map for bag add-on detection ──
+        _fare_type_map: dict[str, float] = {}
+        _fare_bag_kg: dict[str, int] = {}
+        # FlySafair fare names (API returns "Low", "Standard", "BusinessClass")
+        _FA_NO_BAG = {"basic", "lite", "light", "eco", "value", "saver", "low"}
+        _FA_BAG = {"standard", "plus", "flex", "flexi", "comfort", "advantage", "businessclass", "business"}
+        for ft in flight.get("fareTypes", []):
+            ft_name = (ft.get("fareTypeName") or ft.get("name") or "").lower().strip()
+            for fare in ft.get("fares", []):
+                if fare.get("soldOut"):
+                    continue
+                p = fare.get("price", 0)
+                if p > 0 and ft_name and ft_name not in _fare_type_map:
+                    _fare_type_map[ft_name] = float(p)
+            # Extract baggage allowance
+            ba = ft.get("baggageAllowance") or ft.get("baggage") or {}
+            if isinstance(ba, dict):
+                kg = (ba.get("checkedBaggage") or ba.get("checked") or
+                      ba.get("weight") or ba.get("kg") or 0)
+                try:
+                    _fare_bag_kg[ft_name] = int(float(kg))
+                except (TypeError, ValueError):
+                    pass
 
         lowest_price = flight.get("lowestPriceTotal") or flight.get("lowestPriceSinglePax")
         if not lowest_price or lowest_price <= 0:
@@ -313,10 +341,41 @@ class FlySafairConnectorClient:
             or f"{segments[0].flight_no}_{segments[0].departure.isoformat()}"
         )
 
+        # ── Bag add-on from fare types ───────────────────────────────
+        _fa_base: float | None = None
+        _fa_bag: float | None = None
+        _fa_bag_kg = 20  # FlySafair standard checked bag
+        for bname, bprice in _fare_type_map.items():
+            if any(n in bname for n in _FA_NO_BAG):
+                if _fa_base is None or bprice < _fa_base:
+                    _fa_base = bprice
+            elif any(n in bname for n in _FA_BAG):
+                if _fa_bag is None or bprice < _fa_bag:
+                    _fa_bag = bprice
+                    _fa_bag_kg = _fare_bag_kg.get(bname) or 20  # default 20 kg when API returns 0
+
+        _fa_conditions: dict[str, str] = {}
+        _fa_bags: dict = {}
+        if _fa_base is not None and _fa_bag is not None:
+            _add_on = round(_fa_bag - _fa_base, 2)
+            if _add_on > 0:
+                _fa_bags["checked"] = _add_on
+                _fa_conditions["checked_bag"] = "not included (Basic fare)"
+                _fa_conditions["carry_on"] = (
+                    f"checked bag ({_fa_bag_kg} kg) from +{_add_on:.2f} {currency}"
+                )
+        elif _fa_bag is not None and _fa_base is None:
+            _fa_conditions["checked_bag"] = f"{_fa_bag_kg} kg included"
+            _fa_bags["checked"] = 0.0
+
+        _fa_conditions["seat"] = "seat selection add-on from ~40 ZAR"
+
         return {
             "price": float(lowest_price),
             "key": flight_key,
             "route": route,
+            "conditions": _fa_conditions,
+            "bags_price": _fa_bags,
         }
 
     @staticmethod

@@ -47,6 +47,9 @@ _SUB_KEY = "3b6a6994753b4efc86376552e52b8432"
 _TOKEN_URL = "/api/prod-token/api/v1/token"
 _SEARCH_URL = "/api/prod-availability/api/availability/v3/search"
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
+
 _browser = None
 _context = None
 _pw_instance = None
@@ -208,6 +211,24 @@ class SpiritConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(
+                        anc_origin, anc_dest,
+                        req.date_from.isoformat(), req.adults, ob_result.currency,
+                    ),
+                    timeout=20.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("NK: ancillary fetch timed out")
+            except Exception as _anc_err:
+                logger.debug("NK: ancillary fetch error: %s", _anc_err)
         return ob_result
 
 
@@ -386,6 +407,12 @@ class SpiritConnectorClient:
             offers = self._parse_response(data, req)
             offers.sort(key=lambda o: o.price)
 
+            # Cache bundle-derived ancillary data for _fetch_ancillaries
+            bundle_anc = self._parse_bundle_ancillary(data)
+            if bundle_anc:
+                _anc_key = f"nk_{req.origin}_{req.destination}_{req.date_from}"
+                _ancillary_cache[_anc_key] = (time.time(), bundle_anc)
+
             elapsed = time.monotonic() - t0
             logger.info("NK %s->%s returned %d offers in %.1fs", req.origin, req.destination, len(offers), elapsed)
 
@@ -547,6 +574,105 @@ class SpiritConnectorClient:
             source="spirit_direct",
             source_tier="free",
         )
+
+    # ------------------------------------------------------------------
+    # Ancillary pricing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_bundle_ancillary(data: Any) -> dict | None:
+        """Extract carry-on / bag pricing from the bundle availability block in the
+        Navitaire availability/v3/search response (returned when
+        includeBundleAvailability=True is set in the request)."""
+        try:
+            d = data.get("data", data) if isinstance(data, dict) else {}
+            bundle_avail = d.get("bundleAvailability") or {}
+            trip_bundles = bundle_avail.get("tripBundles") or bundle_avail.get("bundles") or []
+
+            carry_on_price: float | None = None
+
+            for tb in (trip_bundles if isinstance(trip_bundles, list) else []):
+                bundles_list = tb.get("bundles") if isinstance(tb, dict) else []
+                if isinstance(tb, dict) and "bundleCode" in tb:
+                    bundles_list = trip_bundles
+
+                for b in (bundles_list if isinstance(bundles_list, list) else []):
+                    if not isinstance(b, dict):
+                        continue
+                    code = str(b.get("bundleCode", "")).upper()
+                    price_data = b.get("bundlePriceData") or b.get("price") or {}
+                    if isinstance(price_data, dict):
+                        price = price_data.get("totalPrice") or price_data.get("amount") or 0.0
+                    else:
+                        price = float(price_data) if price_data else 0.0
+
+                    # Spirit Standard (BST/BNS) = carry-on included
+                    if code in ("BST", "BNS", "STANDARD") and price and carry_on_price is None:
+                        carry_on_price = float(price)
+                break  # Only use first trip bundle
+
+            if carry_on_price is not None and carry_on_price > 0:
+                return {
+                    "bags_from": carry_on_price,
+                    "bags_note": f"carry-on from +USD {carry_on_price:.0f} (add bundle at booking)",
+                    "seat_from": 1.0,
+                    "seat_note": "seat selection from +USD 1",
+                    "currency": "USD",
+                }
+        except Exception:
+            pass
+        return None
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        cache_key = f"nk_{origin}_{dest}_{date_str}"
+        now = time.time()
+        if cache_key in _ancillary_cache:
+            ts, cached = _ancillary_cache[cache_key]
+            if now - ts < _ANCILLARY_CACHE_TTL:
+                return cached
+
+        # Spirit Saver$ fares don't include carry-on; add-on at booking ~$35–$65.
+        result: dict = {
+            "carry_on_from": 39.0,
+            "carry_on_note": "carry-on from +USD 39 (Saver$ — no bags on base fare)",
+            "checked_from": 45.0,
+            "checked_note": "first checked bag from +USD 45 (add at booking, cheaper than airport)",
+            "seat_from": 1.0,
+            "seat_note": "seat selection from +USD 1",
+            "currency": "USD",
+        }
+        _ancillary_cache[cache_key] = (now, result)
+        return result
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        carry_on_from = ancillary.get("carry_on_from")
+        carry_on_note = ancillary.get("carry_on_note")
+        checked_from = ancillary.get("checked_from")
+        checked_note = ancillary.get("checked_note")
+        seat_from = ancillary.get("seat_from")
+        seat_note = ancillary.get("seat_note")
+        anc_currency = ancillary.get("currency", "USD")
+        for offer in offers:
+            ccy_ok = offer.currency.upper() == anc_currency.upper()
+            if carry_on_note:
+                offer.conditions["carry_on"] = carry_on_note
+            if checked_note:
+                offer.conditions["checked_bag"] = checked_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if carry_on_from is not None and (carry_on_from == 0.0 or ccy_ok):
+                offer.bags_price["carry_on"] = carry_on_from
+            if checked_from is not None and (checked_from == 0.0 or ccy_ok):
+                offer.bags_price["checked_bag"] = checked_from
+            if seat_from is not None and (seat_from == 0.0 or ccy_ok):
+                offer.bags_price["seat_selection"] = seat_from
 
     # ------------------------------------------------------------------
     # Helpers

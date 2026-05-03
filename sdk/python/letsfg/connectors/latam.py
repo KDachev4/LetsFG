@@ -453,6 +453,8 @@ class LatamConnectorClient:
             offer_id = hashlib.md5(offer_key.encode()).hexdigest()[:12]
             all_airlines = list({s.airline for s in segments})
 
+            conditions, bags_price = self._extract_la_bag_info(flight, currency)
+
             offers.append(FlightOffer(
                 id=f"la_{offer_id}",
                 price=round(price, 2),
@@ -460,6 +462,8 @@ class LatamConnectorClient:
                 outbound=route,
                 airlines=[self._airline_name(a) for a in all_airlines],
                 owner_airline="LA",
+                conditions=conditions,
+                bags_price=bags_price,
                 booking_url=self._user_url(req),
                 is_locked=False,
                 source="latam_direct",
@@ -467,6 +471,92 @@ class LatamConnectorClient:
             ))
 
         return offers
+
+    @staticmethod
+    def _extract_la_bag_info(flight: dict, currency: str) -> tuple[dict, dict]:
+        """Extract bag allowance from LATAM BFF flight entry."""
+        conditions: dict[str, str] = {}
+        bags_price: dict[str, float] = {}
+
+        # BFF v2: summary.brands[] has fare family + price
+        summary = flight.get("summary") or {}
+        brands = summary.get("brands") if isinstance(summary, dict) else None
+        fare_families = (
+            flight.get("fareFamilies") or flight.get("cabins")
+            or (brands if isinstance(brands, list) else None)
+            or []
+        )
+
+        cheapest_family: dict = {}
+        min_price = float("inf")
+        for ff in (fare_families if isinstance(fare_families, list) else []):
+            if not isinstance(ff, dict):
+                continue
+            p_obj = ff.get("price") or ff.get("amount") or ff.get("total") or {}
+            p = (
+                p_obj.get("amount") or p_obj.get("total")
+                if isinstance(p_obj, dict) else p_obj
+            )
+            try:
+                pf = float(p) if p is not None else float("inf")
+            except (TypeError, ValueError):
+                pf = float("inf")
+            if pf < min_price:
+                min_price = pf
+                cheapest_family = ff
+            # If price unknown, use first entry
+            if not cheapest_family:
+                cheapest_family = ff
+
+        if not cheapest_family and isinstance(fare_families, list) and fare_families:
+            cheapest_family = fare_families[0] if isinstance(fare_families[0], dict) else {}
+
+        fare_name = str(
+            cheapest_family.get("brandText") or cheapest_family.get("brandName")
+            or cheapest_family.get("name") or cheapest_family.get("code")
+            or cheapest_family.get("fareFamily") or ""
+        )
+        if fare_name:
+            conditions["fare_family"] = fare_name
+
+        bag_allow = (
+            cheapest_family.get("baggageAllowance") or cheapest_family.get("baggage")
+            or cheapest_family.get("checkedBag") or {}
+        )
+        if isinstance(bag_allow, dict) and bag_allow:
+            qty = (
+                bag_allow.get("quantity") or bag_allow.get("pieces")
+                or bag_allow.get("count") or bag_allow.get("number")
+            )
+            if qty is not None:
+                try:
+                    qty_int = int(qty)
+                    if qty_int == 0:
+                        conditions["checked_bag"] = "no free checked bag (Light fare)"
+                    else:
+                        weight = bag_allow.get("weight") or bag_allow.get("maxWeight") or 23
+                        conditions["checked_bag"] = f"{qty_int}x {weight}kg bag included"
+                        bags_price["checked_bag"] = 0.0
+                except (TypeError, ValueError):
+                    pass
+
+        # Fallback: infer from LATAM fare name
+        if "checked_bag" not in conditions and fare_name:
+            name_upper = fare_name.upper()
+            if "LIGHT" in name_upper or "BASIC" in name_upper:
+                conditions["checked_bag"] = "no free checked bag (Light/Basic fare)"
+            elif any(k in name_upper for k in ("ECONOMY", "ECONOM", "PLUS", "FLEX")):
+                if "PLUS" in name_upper or "FLEX" in name_upper:
+                    conditions["checked_bag"] = "2x 23kg bags included"
+                    bags_price["checked_bag"] = 0.0
+                else:
+                    conditions["checked_bag"] = "1x 23kg bag included"
+                    bags_price["checked_bag"] = 0.0
+            elif "PREMIUM" in name_upper or "BUSINESS" in name_upper or "TOP" in name_upper:
+                conditions["checked_bag"] = "2x 32kg bags included"
+                bags_price["checked_bag"] = 0.0
+
+        return conditions, bags_price
 
     def _extract_segments(self, flight: dict, req: FlightSearchRequest) -> list[FlightSegment]:
         segments: list[FlightSegment] = []

@@ -37,6 +37,8 @@ from .browser import get_curl_cffi_proxies
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 _BASE = "https://www.klm.nl"
 _SITE_EDITION = "en-nl"
 _HEADERS = {
@@ -187,7 +189,46 @@ class KlmConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
         return ob_result
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        # KLM Light fare: no bag; Standard: 1×23 kg included.
+        return {
+            "bags_note": "Economy Light: no checked bag, first bag from EUR 20. Economy Standard/Flex: 1×23 kg included. Carry-on included on all fares.",
+            "seat_note": "Seat selection: from EUR 15 (Light). Standard seat included on Standard/Flex fares.",
+            "bags_from": None,
+            "currency": currency,
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
         t0 = time.monotonic()

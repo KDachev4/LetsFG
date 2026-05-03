@@ -49,6 +49,8 @@ from .airline_routes import get_city_airports
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 # -- Chrome flags matching MCP/Pegasus pattern (Akamai-safe) ---------
 _CHROME_FLAGS = [
     "--disable-field-trial-config",
@@ -249,8 +251,46 @@ class AmericanConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
         return ob_result
 
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        # AA: Main Cabin first bag from USD 35 for most passengers. Basic Economy: no bag.
+        return {
+            "bags_note": "Economy Main Cabin: first checked bag from USD 35 (waived for AAdvantage cardholders/elite). Basic Economy: no free checked bag, first bag from USD 35.",
+            "seat_note": "Seat selection: standard seats at booking. Preferred/Main Cabin Extra from USD 20–60.",
+            "bags_from": 35.0,
+            "currency": "USD",
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     async def _search_ow(
         self, req: FlightSearchRequest
@@ -679,7 +719,20 @@ class AmericanConnectorClient:
                 f"AA-{sl.get('id', '')}-{req.date_from}".encode()
             ).hexdigest()[:16]
 
-            return FlightOffer(
+            # Detect Basic Economy vs Main Cabin from productType
+            prod_type = (
+                cheapest.get("productType")
+                or cheapest.get("bookingCode")
+                or ""
+            ).upper()
+            if "BASIC" in prod_type:
+                _aa_bag_note = "Basic Economy: no free checked bag. First bag from USD 35."
+                _aa_bag_price: float | None = 35.0
+            else:
+                _aa_bag_note = "Main Cabin: first checked bag from USD 35 (waived for AAdvantage cardholders / elite). Basic Economy: no free bag."
+                _aa_bag_price = 35.0
+
+            offer = FlightOffer(
                 id=f"aa-{offer_id}",
                 price=float(price),
                 currency=currency,
@@ -702,6 +755,11 @@ class AmericanConnectorClient:
                     f"&departDate={req.date_from}"
                 ),
             )
+            offer.conditions["carry_on"] = _aa_bag_note
+            offer.conditions["seat"] = "Seat selection: standard seats at booking. Preferred/Main Cabin Extra from USD 20–60."
+            if _aa_bag_price is not None:
+                offer.bags_price["carry_on"] = _aa_bag_price
+            return offer
 
         except Exception as e:
             logger.debug("American: failed to parse slice: %s", e)

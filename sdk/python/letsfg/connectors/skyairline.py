@@ -289,6 +289,8 @@ class SkyAirlineConnectorClient:
                 f"h2_{orig}{dest}{dep_date}{price_f}{cabin}".encode()
             ).hexdigest()[:12]
 
+            conditions = self._extract_fare_conditions(fare)
+
             offers.append(FlightOffer(
                 id=f"h2_{fid}",
                 price=price_f,
@@ -298,6 +300,7 @@ class SkyAirlineConnectorClient:
                 inbound=None,
                 airlines=["Sky Airline"],
                 owner_airline="H2",
+                conditions=conditions,
                 booking_url=(
                     f"https://booking.skyairline.com/search/"
                     f"?origin={req.origin}&destination={req.destination}"
@@ -310,6 +313,25 @@ class SkyAirlineConnectorClient:
             ))
 
         return offers
+
+    @staticmethod
+    def _extract_fare_conditions(fare: dict) -> dict[str, str]:
+        conditions: dict[str, str] = {}
+        branded_fare = fare.get("brandedFareClass")
+        if isinstance(branded_fare, str) and branded_fare.strip():
+            fare_name = branded_fare.strip()
+            conditions["fare_family"] = fare_name
+            name_upper = fare_name.upper()
+            # Sky Airline fare families: BASE/LIGHT=no bag, CLASS/ECONOMY=1 bag, FULL/FLEX=2 bags
+            if any(k in name_upper for k in ("BASE", "LIGHT", "BASIC", "ZERO", "MINI", "SKY BASE")):
+                conditions["checked_bag"] = "no free checked bag"
+            elif any(k in name_upper for k in ("FULL", "FLEX", "PLUS", "PREMIUM", "BUSINESS")):
+                conditions["checked_bag"] = "2x 23kg bags included"
+            elif any(k in name_upper for k in ("CLASS", "CLASSIC", "ECONOMY", "STANDARD", "SKY CLASS")):
+                conditions["checked_bag"] = "1x 23kg bag included"
+        else:
+            conditions["fare_upgrade_note"] = "Route page exposes base fare only; no baggage or seat pricing"
+        return conditions
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:
         h = hashlib.md5(f"skyairline{req.origin}{req.destination}{req.date_from}{req.return_from or ''}".encode()).hexdigest()[:12]

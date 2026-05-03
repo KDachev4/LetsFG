@@ -49,6 +49,8 @@ from .airline_routes import get_country, CITY_AIRPORTS, city_match_set
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 # ── Sputnik API (EveryMundo) — primary fast path ──
 _SPUTNIK_URL = "https://openair-california.airtrfx.com/airfare-sputnik-service/v3/tk/fares/grouped-routes"
 _SPUTNIK_KEY = "HeQpRjsFI5xlAaSx2onkjc1HTK0ukqA1IrVvd5fvaMhNtzLTxInTpeYB1MK93pah"
@@ -222,8 +224,46 @@ class TurkishConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
         return ob_result
 
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        # Turkish Airlines includes checked bag on all economy fares.
+        return {
+            "bags_note": "1 checked bag included (20 kg domestic / 23 kg international). Carry-on 8 kg included.",
+            "seat_note": "Seat selection: free at online check-in (72 h before). Preferred/extra-legroom from USD 15.",
+            "bags_from": None,
+            "currency": currency,
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
         # Fast path: Sputnik API (no browser needed, ~1s)
@@ -231,16 +271,19 @@ class TurkishConnectorClient:
         if sputnik_offers:
             _td = req.date_from.date() if isinstance(req.date_from, datetime) else req.date_from
             sputnik_offers = [o for o in sputnik_offers if o.outbound and o.outbound.segments and o.outbound.segments[0].departure.date() == _td]
-            sputnik_offers.sort(key=lambda o: o.price if o.price > 0 else float("inf"))
-            h = hashlib.md5(f"tk{req.origin}{req.destination}{req.date_from}".encode()).hexdigest()[:12]
-            return FlightSearchResponse(
-                search_id=f"fs_{h}",
-                origin=req.origin,
-                destination=req.destination,
-                currency=sputnik_offers[0].currency,
-                offers=sputnik_offers,
-                total_results=len(sputnik_offers),
-            )
+            if not sputnik_offers:
+                pass  # fall through to CDP path
+            else:
+                sputnik_offers.sort(key=lambda o: o.price if o.price > 0 else float("inf"))
+                h = hashlib.md5(f"tk{req.origin}{req.destination}{req.date_from}".encode()).hexdigest()[:12]
+                return FlightSearchResponse(
+                    search_id=f"fs_{h}",
+                    origin=req.origin,
+                    destination=req.destination,
+                    currency=sputnik_offers[0].currency,
+                    offers=sputnik_offers,
+                    total_results=len(sputnik_offers),
+                )
 
         # Slow path: CDP Chrome form fill + API interception
         # Retry once: first attempt warms PX cookies; second uses them.

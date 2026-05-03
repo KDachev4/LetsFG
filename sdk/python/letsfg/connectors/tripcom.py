@@ -32,6 +32,8 @@ from ..models.flights import (
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 # CNY exchange rates (approximate) — updated periodically
 _CNY_RATES = {
     "EUR": 0.127, "USD": 0.138, "GBP": 0.109,
@@ -83,7 +85,40 @@ class TripcomConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s→%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s→%s: %s", anc_origin, anc_dest, _anc_err)
         return ob_result
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        return None
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     async def _search_ow(
         self, req: FlightSearchRequest
@@ -283,6 +318,8 @@ def _parse_ctrip(
             p0 = prices[0]
             adult_price = float(p0.get("adultPrice", 0))
             adult_tax = float(p0.get("adultTax", 0))
+            free_checked = int(p0.get("freeCheckedBaggage", 0) or 0)
+            free_cabin = int(p0.get("freeCabinBaggage", 0) or 0)
             total_cny = adult_price + adult_tax
             if total_cny <= 0:
                 continue
@@ -363,7 +400,7 @@ def _parse_ctrip(
                 f"tc_{itin_id}_{total_cny}".encode()
             ).hexdigest()[:10]
 
-            offers.append(FlightOffer(
+            _tc_offer = FlightOffer(
                 id=f"tc_{h}",
                 price=price,
                 currency=target_cur,
@@ -380,7 +417,14 @@ def _parse_ctrip(
                     f"{req.origin.lower()}-to-{req.destination.lower()}/"
                     f"tickets-{req.origin.lower()}-{req.destination.lower()}"
                 ),
-            ))
+            )
+            if free_checked == 0 and free_cabin == 0:
+                _tc_offer.conditions["carry_on"] = "No free baggage included"
+            elif free_checked > 0:
+                _tc_offer.conditions["carry_on"] = f"{free_checked} free checked bag(s) included"
+            if free_cabin > 0:
+                _tc_offer.conditions["carry_on"] = f"{free_cabin} free cabin bag(s) included"
+            offers.append(_tc_offer)
         except Exception as e:
             logger.warning("TRIPCOM: parse itinerary failed: %s", e)
 

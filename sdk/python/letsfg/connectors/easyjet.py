@@ -45,6 +45,9 @@ from .airline_routes import get_city_airports
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
+
 
 def _extract_hhmm(value: object) -> str:
     if isinstance(value, datetime):
@@ -305,7 +308,7 @@ class EasyjetConnectorClient:
             f"easyjet{req.origin}{req.destination}{req.date_from}{req.return_from or ''}".encode()
         ).hexdigest()[:12]
 
-        return FlightSearchResponse(
+        resp = FlightSearchResponse(
             search_id=f"fs_{search_hash}",
             origin=req.origin,
             destination=req.destination,
@@ -313,6 +316,55 @@ class EasyjetConnectorClient:
             offers=ob_offers,
             total_results=len(ob_offers),
         )
+        if resp.offers:
+            segs = resp.offers[0].outbound.segments if resp.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, resp.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(resp.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
+        return resp
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        """EasyJet STANDARD fare always includes 1 cabin bag — enrich note only."""
+        return {
+            "bags_from": 0.0,
+            "bags_note": "1 cabin bag (56\u00d745\u00d725 cm, up to 15 kg) included in base fare",
+            "checked_bag_from": 18.0,
+            "checked_bag_note": "First checked bag (23 kg) from ~EUR 18",
+            "seat_from": 5.0,
+            "seat_note": "Seat selection add-on from ~EUR 5",
+            "currency": "EUR",
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        checked_bag_note = ancillary.get("checked_bag_note")
+        checked_bag_from = ancillary.get("checked_bag_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat_from"] = seat_note
+            if checked_bag_note:
+                offer.conditions["checked_bag"] = checked_bag_note
+            if bags_from is not None:
+                offer.bags_price["carry_on"] = bags_from
+            if checked_bag_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["checked_bag"] = checked_bag_from
 
     async def _search_fanout(self, req: FlightSearchRequest) -> tuple[list[FlightOffer], str]:
         origins = get_city_airports(req.origin)

@@ -44,6 +44,9 @@ from .browser import auto_block_if_proxied, get_curl_cffi_proxies, launch_headed
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
+
 # ── Direct API constants ─────────────────────────────────
 _AUTH_URL = "https://ams.vueling.com/asm/v1/Auth"
 _GQL_URL = "https://ams.vueling.com/avy/v1/graphql"
@@ -234,9 +237,77 @@ class VuelingConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
         return ob_result
 
 
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        from .ancillary_ref import get_ancillary_ref
+        ref = get_ancillary_ref("VY")
+        if not ref:
+            return None
+        cur = ref.get("currency", "EUR")
+        carry_on = ref.get("carry_on")
+        checked_bag = ref.get("checked_bag")
+        seat = ref.get("seat")
+        carry_on_note = ref.get("carry_on_note") or (
+            "1 cabin bag included" if carry_on == 0.0
+            else f"Carry-on add-on from ~{cur} {carry_on:.0f}" if carry_on is not None
+            else None
+        )
+        checked_note = ref.get("checked_bag_note") or (
+            "1 checked bag included" if checked_bag == 0.0
+            else f"First checked bag from ~{cur} {checked_bag:.0f}" if checked_bag is not None
+            else None
+        )
+        seat_note = (
+            "Seat selection included" if seat == 0.0
+            else f"Seat selection from ~{cur} {seat:.0f}" if seat is not None
+            else None
+        )
+        return {
+            "bags_from": carry_on,
+            "bags_note": carry_on_note,
+            "checked_bag_from": checked_bag,
+            "checked_bag_note": checked_note,
+            "seat_from": seat,
+            "seat_note": seat_note,
+            "currency": cur,
+        }
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        checked_bag_note = ancillary.get("checked_bag_note")
+        checked_bag_from = ancillary.get("checked_bag_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat_from"] = seat_note
+            if checked_bag_note:
+                offer.conditions["checked_bag"] = checked_bag_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
+            if checked_bag_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["checked_bag"] = checked_bag_from
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
         # Try direct API first (no browser)
         result = await self._search_via_api(req)
@@ -567,23 +638,24 @@ class VuelingConnectorClient:
 
         currency = ams.get("currencyCode", req.currency or "EUR")
 
-        # Build fare price lookup: fareAvailabilityKey -> cheapest {amount, productClass}
-        fare_lookup: dict[str, dict] = {}
+        # Build fare price lookup: fareAvailabilityKey -> {productClass: amount}
+        # Track all fare classes so we can compute live bag add-on price (IB - BB)
+        fare_lookup: dict[str, dict[str, float]] = {}
         for fa_entry in ams.get("faresAvailable", []):
             val = fa_entry.get("value", {})
             fak = val.get("fareAvailabilityKey", "")
             if not fak:
                 continue
+            if fak not in fare_lookup:
+                fare_lookup[fak] = {}
             for fare in val.get("fares", []):
+                pc = fare.get("productClass", "")
                 for pf in fare.get("passengerFares", []):
                     amount = pf.get("amsFareAmount")
-                    if amount is not None:
-                        existing = fare_lookup.get(fak, {}).get("amount")
+                    if amount is not None and amount > 0:
+                        existing = fare_lookup[fak].get(pc)
                         if existing is None or amount < existing:
-                            fare_lookup[fak] = {
-                                "amount": amount,
-                                "productClass": fare.get("productClass", ""),
-                            }
+                            fare_lookup[fak][pc] = amount
 
         # Extract outbound journeys
         trips_list = ams.get("trips", [])
@@ -621,19 +693,28 @@ class VuelingConnectorClient:
             origin = des.get("origin", req.origin)
             destination = des.get("destination", req.destination)
 
-            # Find cheapest fare: journey.fares[] has fareAvailabilityKey entries
-            best_price: float | None = None
-            best_class = ""
+            # Find fares: collect all productClass prices for this journey
+            all_class_prices: dict[str, float] = {}
             for fare in journey.get("fares", []):
                 fak = fare.get("fareAvailabilityKey", "")
-                info = fare_lookup.get(fak)
-                if info and info["amount"] is not None and info["amount"] > 0:
-                    if best_price is None or info["amount"] < best_price:
-                        best_price = info["amount"]
-                        best_class = info.get("productClass", "")
+                class_prices = fare_lookup.get(fak, {})
+                for pc, amt in class_prices.items():
+                    if pc not in all_class_prices or amt < all_class_prices[pc]:
+                        all_class_prices[pc] = amt
 
-            if best_price is None:
+            if not all_class_prices:
                 continue
+
+            # Best price = cheapest fare class (BB = Basic, no checked bag)
+            best_price = min(all_class_prices.values())
+            best_class = min(all_class_prices, key=all_class_prices.get)
+
+            # Live checked bag price: IB (Optima, bag included) - BB (Basic, no bag)
+            bb_price = all_class_prices.get("BB")
+            ib_price = all_class_prices.get("IB")
+            live_bag_price: float | None = None
+            if bb_price and ib_price and ib_price > bb_price:
+                live_bag_price = round(ib_price - bb_price, 2)
 
             # Build segments
             segments_data = journey.get("segments", [])
@@ -673,7 +754,7 @@ class VuelingConnectorClient:
             offer_key = "_".join(flight_numbers) + f"_{dep_str[:10]}"
             price = round(best_price, 2)
 
-            offers.append(FlightOffer(
+            offer = FlightOffer(
                 id=f"vy_{hashlib.md5(offer_key.encode()).hexdigest()[:12]}",
                 price=price,
                 currency=currency,
@@ -686,7 +767,14 @@ class VuelingConnectorClient:
                 is_locked=False,
                 source="vueling_direct",
                 source_tier="free",
-            ))
+            )
+            if live_bag_price is not None:
+                offer.bags_price["checked_bag"] = live_bag_price
+                offer.conditions["checked_bag"] = (
+                    f"First checked bag: {currency} {live_bag_price:.0f} (live)"
+                )
+                offer.conditions["carry_on"] = "10 kg cabin bag included in all fares"
+            offers.append(offer)
 
         logger.info(
             "Vueling: found %d offers for %s->%s on %s",
@@ -703,19 +791,22 @@ class VuelingConnectorClient:
         if not ams:
             return []
         currency = ams.get("currencyCode", req.currency or "EUR")
-        fare_lookup: dict[str, dict] = {}
+        fare_lookup: dict[str, dict[str, float]] = {}
         for fa_entry in ams.get("faresAvailable", []):
             val = fa_entry.get("value", {})
             fak = val.get("fareAvailabilityKey", "")
             if not fak:
                 continue
+            if fak not in fare_lookup:
+                fare_lookup[fak] = {}
             for fare in val.get("fares", []):
+                pc = fare.get("productClass", "")
                 for pf in fare.get("passengerFares", []):
                     amount = pf.get("amsFareAmount")
-                    if amount is not None:
-                        existing = fare_lookup.get(fak, {}).get("amount")
+                    if amount is not None and amount > 0:
+                        existing = fare_lookup[fak].get(pc)
                         if existing is None or amount < existing:
-                            fare_lookup[fak] = {"amount": amount, "productClass": fare.get("productClass", "")}
+                            fare_lookup[fak][pc] = amount
 
         trips_list = ams.get("trips", [])
         if not trips_list:
@@ -748,17 +839,22 @@ class VuelingConnectorClient:
             if journey.get("notForSale") or journey.get("isSoldOut"):
                 continue
             des = journey.get("designator", {})
-            best_price: float | None = None
-            best_class = ""
+            all_class_prices: dict[str, float] = {}
             for fare in journey.get("fares", []):
                 fak = fare.get("fareAvailabilityKey", "")
-                info = fare_lookup.get(fak)
-                if info and info["amount"] is not None and info["amount"] > 0:
-                    if best_price is None or info["amount"] < best_price:
-                        best_price = info["amount"]
-                        best_class = info.get("productClass", "")
-            if best_price is None:
+                class_prices = fare_lookup.get(fak, {})
+                for pc, amt in class_prices.items():
+                    if pc not in all_class_prices or amt < all_class_prices[pc]:
+                        all_class_prices[pc] = amt
+            if not all_class_prices:
                 continue
+            best_price = min(all_class_prices.values())
+            best_class = min(all_class_prices, key=all_class_prices.get)
+            bb_price = all_class_prices.get("BB")
+            ib_price = all_class_prices.get("IB")
+            live_bag_price: float | None = None
+            if bb_price and ib_price and ib_price > bb_price:
+                live_bag_price = round(ib_price - bb_price, 2)
             segments_data = journey.get("segments", [])
             flight_segments: list[FlightSegment] = []
             flight_numbers: list[str] = []
@@ -783,7 +879,7 @@ class VuelingConnectorClient:
             dep_str = des.get("departure", "")
             offer_key = "_".join(flight_numbers) + f"_{dep_str[:10]}_ret"
             price = round(best_price, 2)
-            offers.append(FlightOffer(
+            offer = FlightOffer(
                 id=f"vy_{hashlib.md5(offer_key.encode()).hexdigest()[:12]}",
                 price=price, currency=currency,
                 price_formatted=f"{price:.2f} {currency}",
@@ -791,7 +887,14 @@ class VuelingConnectorClient:
                 airlines=["Vueling"], owner_airline="VY",
                 booking_url=booking_url, is_locked=False,
                 source="vueling_direct", source_tier="free",
-            ))
+            )
+            if live_bag_price is not None:
+                offer.bags_price["checked_bag"] = live_bag_price
+                offer.conditions["checked_bag"] = (
+                    f"First checked bag: {currency} {live_bag_price:.0f} (live)"
+                )
+                offer.conditions["carry_on"] = "10 kg cabin bag included in all fares"
+            offers.append(offer)
         return offers
 
     def _build_rt_combos(

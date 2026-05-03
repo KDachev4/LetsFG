@@ -49,6 +49,8 @@ from .browser import find_chrome, stealth_popen_kwargs, _launched_procs, proxy_c
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 _DEBUG_PORT = 9457
 _USER_DATA_DIR = os.path.join(
     os.environ.get("TEMP", os.environ.get("TMPDIR", "/tmp")), ".emirates_chrome_data"
@@ -1131,6 +1133,21 @@ class EmiratesConnectorClient:
             ).hexdigest()[:12]
 
             currency = offers[0].currency if offers else "AED"
+            if offers:
+                segs = offers[0].outbound.segments if offers[0].outbound else []
+                anc_origin = segs[0].origin if segs else req.origin
+                anc_dest = segs[-1].destination if segs else req.destination
+                try:
+                    ancillary = await asyncio.wait_for(
+                        self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, currency),
+                        timeout=45.0,
+                    )
+                    if ancillary:
+                        self._apply_ancillaries(offers, ancillary)
+                except (asyncio.TimeoutError, TimeoutError):
+                    logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+                except Exception as _anc_err:
+                    logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
             return FlightSearchResponse(
                 search_id=f"fs_{search_hash}",
                 origin=req.origin,
@@ -1148,6 +1165,31 @@ class EmiratesConnectorClient:
                 await page.close()
             except Exception:
                 pass
+
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        # Emirates includes checked bag on all economy fares.
+        return {
+            "bags_note": "1 checked bag included (25–35 kg depending on route). Carry-on 7 kg included.",
+            "seat_note": "Seat selection: standard seat free at online check-in. Preferred/extra-legroom from USD 25.",
+            "bags_from": None,
+            "currency": currency,
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     # ------------------------------------------------------------------
     # Form fill helpers

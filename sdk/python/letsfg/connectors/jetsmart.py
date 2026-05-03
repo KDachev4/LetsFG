@@ -481,20 +481,114 @@ class JetSmartConnectorClient:
         month_es = f"{_MONTHS_ES[target_month]} {target_year}"
         month_en = f"{_MONTHS_EN[target_month]} {target_year}"
 
-        # Click the date field to open calendar (if not already open)
+        # Ensure the destinations autocomplete overlay is gone before clicking date input.
+        # After typing city name the overlay class is 'fixed min-w-52 select-none' — match by class.
         await page.evaluate("""() => {
-            const inp = document.querySelector('input[placeholder="Fecha de ida"]')
-                || document.querySelector('input[placeholder="Departure"]')
-                || document.querySelector('input[placeholder="Date"]');
-            if (inp) { inp.click(); }
+            for (const dd of Array.from(document.querySelectorAll('div'))) {
+                const cls = dd.className || '';
+                if ((cls.includes('min-w-52') || cls.includes('select-none'))
+                    && dd.offsetHeight > 0) {
+                    dd.remove();
+                }
+            }
         }""")
+
+        # Click the date field to open calendar (if not already open).
+        # Use Playwright locator with force=True (bypasses element-covered check).
+        _date_opened = False
+        try:
+            await page.locator(
+                'input[placeholder="Fecha de ida"], input[placeholder="Departure"], input[placeholder="Date"]'
+            ).first.click(force=True, timeout=3000)
+            _date_opened = True
+        except Exception as _ce:
+            logger.warning("JetSMART _fill_date: locator force-click on date input failed: %s", str(_ce)[:80])
+        if not _date_opened:
+            await page.evaluate("""() => {
+                const inp = document.querySelector('input[placeholder="Fecha de ida"]')
+                    || document.querySelector('input[placeholder="Departure"]')
+                    || document.querySelector('input[placeholder="Date"]');
+                if (inp) { inp.focus(); inp.click(); }
+            }""")
         await asyncio.sleep(1.0)
+
+        # Helper: detect a calendar overlay using multiple selectors.
+        # IMPORTANT: check *all* element types (not just div) for day number cells,
+        # because JetSMART may use span/button for day cells.
+        # Also require >=20 small day cells to avoid false-positives on the main page body.
+        def _cal_finder_js():
+            return """([monthEs, monthEn]) => {
+                const hasManyDays = (el) => {
+                    const cells = Array.from(el.querySelectorAll('*')).filter(d => {
+                        const txt = (d.textContent||'').trim();
+                        return d.children.length === 0
+                            && /^[0-9]{1,2}$/.test(txt)
+                            && d.offsetHeight > 0 && d.offsetHeight <= 50
+                            && d.offsetWidth > 0 && d.offsetWidth <= 50;
+                    });
+                    return cells.length >= 20;
+                };
+                // Strategy 1: any z-[...] fixed divs that look like a calendar
+                const zDivs = Array.from(document.querySelectorAll('div[class*="z-["]')).filter(d => d.offsetHeight > 0 && hasManyDays(d));
+                // Strategy 2: ac-dropdown2 elements
+                const acDD = Array.from(document.querySelectorAll('ac-dropdown2, [class*="ac-dropdown"]')).filter(d => d.offsetHeight > 0 && hasManyDays(d));
+                // Strategy 3: any visible overlay-looking div with many day cells
+                const anyLarge = Array.from(document.querySelectorAll('div')).filter(d => {
+                    if (!d.offsetHeight) return false;
+                    const r = d.getBoundingClientRect();
+                    return r.width > 200 && r.height > 150 && hasManyDays(d);
+                });
+                const allCandidates = [...zDivs, ...acDD, ...anyLarge];
+                const cal = allCandidates[0] || null;
+                return {
+                    count: allCandidates.length,
+                    calFound: !!cal,
+                    text: cal ? (cal.innerText||'').replace(/\\s+/g,' ').trim().slice(0,80) : '',
+                    zClasses: zDivs.slice(0,3).map(d => (d.className||'').slice(0,60)),
+                    largeDivCount: anyLarge.length
+                };
+            }"""
+
+        _cal_open_diag = await page.evaluate(_cal_finder_js(), [month_es, month_en])
+        logger.warning("JetSMART _fill_date: after inp.click, cal_diag=%s", _cal_open_diag)
+
+        # If calendar isn't open, try a couple more approaches
+        if not _cal_open_diag.get('calFound'):
+            # Try CDP click via mouse at the date input coords (after scrollIntoView)
+            _date_coords = await page.evaluate("""() => {
+                const inp = document.querySelector('input[placeholder="Fecha de ida"]');
+                if (!inp) return null;
+                inp.scrollIntoView({block: 'nearest', behavior: 'instant'});
+                const r = inp.getBoundingClientRect();
+                return {x: r.left + r.width/2, y: r.top + r.height/2};
+            }""")
+            if _date_coords:
+                await page.mouse.click(_date_coords['x'], _date_coords['y'])
+                logger.warning("JetSMART _fill_date: CDP click on date at %s", _date_coords)
+                await asyncio.sleep(1.2)
+                _cal_open_diag = await page.evaluate(_cal_finder_js(), [month_es, month_en])
+                logger.warning("JetSMART _fill_date: after CDP date click, cal_diag=%s", _cal_open_diag)
+            # Last resort: Tab from Destino input to date input (Vue may open calendar on focus)
+            if not _cal_open_diag.get('calFound'):
+                await page.keyboard.press('Tab')
+                await asyncio.sleep(1.0)
+                _cal_open_diag = await page.evaluate(_cal_finder_js(), [month_es, month_en])
+                logger.warning("JetSMART _fill_date: after Tab key, cal_diag=%s", _cal_open_diag)
 
         # Navigate to the target month (scroll/click forward)
         for _ in range(12):
             found = await page.evaluate("""([monthEs, monthEn]) => {
-                // Check if target month heading is visible inside the open calendar dropdown
-                const openDD = document.querySelector('div[class*="z-[9999]"]');
+                const hasManyDays = (el) => {
+                    const cells = Array.from(el.querySelectorAll('*')).filter(d =>
+                        d.children.length === 0 && /^[0-9]{1,2}$/.test((d.textContent||'').trim())
+                        && d.offsetHeight > 0 && d.offsetHeight <= 50 && d.offsetWidth > 0 && d.offsetWidth <= 50);
+                    return cells.length >= 20;
+                };
+                const zDivs = Array.from(document.querySelectorAll('div[class*="z-["]')).filter(d => d.offsetHeight > 0 && hasManyDays(d));
+                const anyLarge = Array.from(document.querySelectorAll('div')).filter(d => {
+                    const r = d.getBoundingClientRect(); return r.width > 200 && r.height > 150 && hasManyDays(d);
+                });
+                const openDD = (zDivs[0] || anyLarge[0]);
                 if (!openDD) return false;
                 const text = openDD.innerText || '';
                 return text.includes(monthEs) || text.includes(monthEn);
@@ -505,7 +599,17 @@ class JetSmartConnectorClient:
 
             # Try clicking next-month navigation (various selectors)
             scrolled = await page.evaluate("""() => {
-                const openDD = document.querySelector('div[class*="z-[9999]"]');
+                const hasManyDays = (el) => {
+                    const cells = Array.from(el.querySelectorAll('*')).filter(d =>
+                        d.children.length === 0 && /^[0-9]{1,2}$/.test((d.textContent||'').trim())
+                        && d.offsetHeight > 0 && d.offsetHeight <= 50 && d.offsetWidth > 0 && d.offsetWidth <= 50);
+                    return cells.length >= 20;
+                };
+                const zDivs = Array.from(document.querySelectorAll('div[class*="z-["]')).filter(d => d.offsetHeight > 0 && hasManyDays(d));
+                const anyLarge = Array.from(document.querySelectorAll('div')).filter(d => {
+                    const r = d.getBoundingClientRect(); return r.width > 200 && r.height > 150 && hasManyDays(d);
+                });
+                const openDD = (zDivs[0] || anyLarge[0]);
                 if (!openDD) return false;
                 // Look for next-month arrow/button
                 const nexts = openDD.querySelectorAll(
@@ -531,12 +635,22 @@ class JetSmartConnectorClient:
         # Click the target day in the correct month section
         clicked_day = await page.evaluate("""([day, monthEs, monthEn]) => {
             const dayStr = String(day);
-            const openDD = document.querySelector('div[class*="z-[9999]"]');
+            const hasManyDays = (el) => {
+                const cells = Array.from(el.querySelectorAll('*')).filter(d =>
+                    d.children.length === 0 && /^[0-9]{1,2}$/.test((d.textContent||'').trim())
+                    && d.offsetHeight > 0 && d.offsetHeight <= 50 && d.offsetWidth > 0 && d.offsetWidth <= 50);
+                return cells.length >= 20;
+            };
+            const zDivs = Array.from(document.querySelectorAll('div[class*="z-["]')).filter(d => d.offsetHeight > 0 && hasManyDays(d));
+            const anyLarge = Array.from(document.querySelectorAll('div')).filter(d => {
+                const r = d.getBoundingClientRect(); return r.width > 200 && r.height > 150 && hasManyDays(d);
+            });
+            const openDD = (zDivs[0] || anyLarge[0]);
             if (!openDD) return false;
 
-            // Find all day divs with cursor-pointer that contain just the day number
-            const allDivs = openDD.querySelectorAll('div');
-            for (const d of allDivs) {
+            // Find all day cells with cursor-pointer that contain just the day number
+            const allEls = openDD.querySelectorAll('*');
+            for (const d of allEls) {
                 if (d.textContent.trim() !== dayStr) continue;
                 if (d.children.length > 0) continue;
                 if (d.offsetHeight === 0) continue;
@@ -562,7 +676,7 @@ class JetSmartConnectorClient:
             }
 
             // Broader fallback: click any visible day matching the number
-            for (const d of allDivs) {
+            for (const d of allEls) {
                 if (d.textContent.trim() === dayStr && d.children.length === 0
                     && d.offsetHeight > 0 && d.className.includes('cursor-pointer')) {
                     d.click();

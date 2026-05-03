@@ -145,7 +145,27 @@ class PeachConnectorClient:
 
         elapsed = time.monotonic() - t0
         if ob_offers:
-            return self._build_response(ob_offers, req, elapsed)
+            resp = self._build_response(ob_offers, req, elapsed)
+            if resp.offers:
+                segs = resp.offers[0].outbound.segments if resp.offers[0].outbound else []
+                anc_origin = segs[0].origin if segs else req.origin
+                anc_dest = segs[-1].destination if segs else req.destination
+                try:
+                    ancillary = await asyncio.wait_for(
+                        self._fetch_ancillaries(
+                            anc_origin, anc_dest,
+                            req.date_from.isoformat() if hasattr(req.date_from, 'isoformat') else str(req.date_from),
+                            req.adults, resp.currency or req.currency,
+                        ),
+                        timeout=45.0,
+                    )
+                    if ancillary:
+                        self._apply_ancillaries(resp.offers, ancillary)
+                except (asyncio.TimeoutError, TimeoutError):
+                    logger.debug("Ancillary fetch timed out for %s->%s", anc_origin, anc_dest)
+                except Exception as _anc_err:
+                    logger.debug("Ancillary fetch error: %s", _anc_err)
+            return resp
         return self._empty(req)
 
     async def _search_ow_page(self, context, req: FlightSearchRequest) -> list[FlightOffer]:
@@ -442,6 +462,82 @@ class PeachConnectorClient:
                 ))
         combined.sort(key=lambda o: o.price)
         return combined
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str,
+    ) -> dict | None:
+        """Return Peach Aviation (MM) ancillary pricing from published tariff reference."""
+        from .ancillary_ref import get_ancillary_ref
+        ref = get_ancillary_ref("MM")
+        if not ref:
+            return None
+        carry_on = ref.get("carry_on")
+        checked = ref.get("checked_bag")
+        seat = ref.get("seat")
+        ref_cur = ref.get("currency", "USD")
+
+        # Carry-on note
+        if note := ref.get("carry_on_note"):
+            bags_note = note
+        elif carry_on == 0.0:
+            kg = ref.get("carry_on_kg", 7)
+            bags_note = f"1 cabin bag included ({kg} kg)"
+        elif carry_on is not None:
+            kg = ref.get("carry_on_kg", 7)
+            bags_note = f"cabin bag from ~{ref_cur} {carry_on:.0f} ({kg} kg)"
+        else:
+            bags_note = None
+
+        # Checked bag note
+        if note := ref.get("checked_bag_note"):
+            checked_note = note
+        elif checked == 0.0:
+            kg = ref.get("checked_bag_kg", 20)
+            checked_note = f"1 checked bag included ({kg} kg)"
+        elif checked is not None:
+            kg = ref.get("checked_bag_kg", 20)
+            checked_note = f"checked bag from ~{ref_cur} {checked:.0f} ({kg} kg)"
+        else:
+            checked_note = None
+
+        # Seat note
+        if seat == 0.0:
+            seat_note = "seat selection included"
+        elif seat is not None:
+            seat_note = f"seat selection from ~{ref_cur} {seat:.0f}"
+        else:
+            seat_note = "seat selection available at checkout"
+
+        return {
+            "bags_from": carry_on,
+            "bags_note": bags_note,
+            "checked_bag_from": checked,
+            "checked_bag_note": checked_note,
+            "seat_from": seat,
+            "seat_note": seat_note,
+            "currency": ref_cur,
+        }
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        checked_note = ancillary.get("checked_bag_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        checked_from = ancillary.get("checked_bag_from")
+        seat_from = ancillary.get("seat_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if checked_note:
+                offer.conditions["checked_bag"] = checked_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
+            if checked_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["checked_bag"] = checked_from
+            if seat_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["seat"] = seat_from
 
     def _empty(self, req: FlightSearchRequest) -> FlightSearchResponse:
         h = hashlib.md5(f"peach{req.origin}{req.destination}{req.date_from}{req.return_from or ''}".encode()).hexdigest()[:12]

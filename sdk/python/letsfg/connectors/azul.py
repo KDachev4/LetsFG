@@ -373,15 +373,86 @@ class AzulConnectorClient:
         if not journey_key and segments:
             journey_key = f"{segments[0].departure.isoformat()}_{segments[0].flight_no}"
 
+        conditions, bags_price = self._extract_azul_bag_info(journey, currency)
+
         return FlightOffer(
             id=f"ad_{hashlib.md5(journey_key.encode()).hexdigest()[:12]}",
             price=round(best_price, 2), currency=currency,
             price_formatted=f"{best_price:.2f} {currency}",
             outbound=route, inbound=None,
             airlines=list(set(s.airline for s in segments)) or ["AD"],
-            owner_airline="AD", booking_url=booking_url,
+            owner_airline="AD",
+            conditions=conditions,
+            bags_price=bags_price,
+            booking_url=booking_url,
             is_locked=False, source="azul_direct", source_tier="free",
         )
+
+    @staticmethod
+    def _extract_azul_bag_info(journey: dict, currency: str) -> tuple[dict, dict]:
+        """Extract bag allowance from cheapest Navitaire fare on the Azul journey."""
+        conditions: dict[str, str] = {}
+        bags_price: dict[str, float] = {}
+
+        fares = journey.get("fares", [])
+        if not fares:
+            return conditions, bags_price
+
+        # Find the fare entry that gave the cheapest price
+        best_price = float("inf")
+        cheapest_fare: dict = {}
+        for fare in fares:
+            if not isinstance(fare, dict):
+                continue
+            pax_fares = fare.get("paxFares") or fare.get("passengerFares") or []
+            fare_min = float("inf")
+            for pf in pax_fares:
+                for key in ("totalAmount", "originalAmount", "fareAmount"):
+                    val = pf.get(key)
+                    if val is not None:
+                        try:
+                            v = float(val)
+                            if v > 0:
+                                fare_min = min(fare_min, v)
+                        except (TypeError, ValueError):
+                            pass
+            if fare_min < best_price:
+                best_price = fare_min
+                cheapest_fare = fare
+
+        if not cheapest_fare and fares:
+            cheapest_fare = fares[0] if isinstance(fares[0], dict) else {}
+
+        bundle_code = str(
+            cheapest_fare.get("bundleCode") or cheapest_fare.get("bundleInformation")
+            or cheapest_fare.get("fareClass") or cheapest_fare.get("fareName")
+            or cheapest_fare.get("fareCode") or cheapest_fare.get("fareSellKey") or ""
+        ).upper()
+
+        if bundle_code:
+            conditions["fare_family"] = bundle_code
+
+        # Azul Navitaire bundleCodes: AZUL (no bag), BLUE (1×23kg), BLACK (2×23kg)
+        if "AZUL" in bundle_code or bundle_code in ("A", "AZ"):
+            conditions["checked_bag"] = "no free checked bag (Azul base fare)"
+        elif "BLACK" in bundle_code or bundle_code in ("BL", "BLK"):
+            conditions["checked_bag"] = "2x 23kg bags included"
+            bags_price["checked_bag"] = 0.0
+        elif "BLUE" in bundle_code or bundle_code in ("BU", "XTRA", "XT"):
+            conditions["checked_bag"] = "1x 23kg bag included"
+            bags_price["checked_bag"] = 0.0
+        elif bundle_code:
+            # Unknown bundle code — try to detect from Navitaire fare services
+            services = cheapest_fare.get("bundleInformation") or cheapest_fare.get("services") or []
+            if isinstance(services, list):
+                for svc in services:
+                    svc_str = str(svc).upper()
+                    if any(k in svc_str for k in ("CHECKED", "BAG", "BAGGAGE", "MALA")):
+                        conditions["checked_bag"] = "checked bag included"
+                        bags_price["checked_bag"] = 0.0
+                        break
+
+        return conditions, bags_price
 
     def _parse_segment(self, seg: dict, req: FlightSearchRequest) -> FlightSegment:
         identifier = seg.get("identifier") or seg.get("designator") or {}

@@ -37,6 +37,8 @@ from .browser import find_chrome, stealth_popen_kwargs, _launched_procs, proxy_c
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 _DEBUG_PORT = 9454
 _USER_DATA_DIR = os.path.join(
     os.environ.get("TEMP", os.environ.get("TMPDIR", "/tmp")), ".qr_chrome_data"
@@ -188,6 +190,58 @@ def _parse_datetime(s: str) -> datetime:
     return datetime.strptime(s[:10], "%Y-%m-%d")
 
 
+def _extract_qr_ancillaries(fare_obj: dict) -> dict:
+    """Parse live bag/seat data from a Qatar fareOffer object.
+
+    fareFamilyFeatures contains typed entries like:
+      {"type": "CHECKIN_BAGGAGE", "localizationKey": "CHECKIN_BAGGAGE.WEIGHT.KG.FF_FEATURE",
+       "parameters": ["30"]}
+    """
+    family_code = fare_obj.get("fareFamilyCode", "")
+    features = fare_obj.get("fareFamilyFeatures", [])
+    if not features:
+        return {}
+
+    checked_kg: Optional[int] = None
+    hand_included = False
+    seat_free = False
+
+    for feat in features:
+        ftype = feat.get("type", "")
+        params = feat.get("parameters", [])
+        loc_key = feat.get("localizationKey", "")
+
+        if ftype == "CHECKIN_BAGGAGE":
+            if "WEIGHT.KG" in loc_key and params:
+                try:
+                    checked_kg = int(params[0])
+                except (ValueError, TypeError):
+                    pass
+            elif "INCLUDED" in loc_key.upper():
+                checked_kg = 23  # generic inclusion
+        elif ftype == "HAND_BAGGAGE":
+            hand_included = True
+        elif ftype == "SEAT_SELECTION" and "FREE" in loc_key.upper():
+            seat_free = True
+
+    if checked_kg is None and not hand_included:
+        return {}
+
+    fare_label = family_code.replace("_", " ").title() if family_code else "Economy"
+
+    if checked_kg is not None and checked_kg > 0:
+        bag_note = f"{fare_label}: 1 checked bag included ({checked_kg} kg). Carry-on 7 kg included."
+    else:
+        bag_note = f"{fare_label}: no checked bag included. First checked bag fee applies."
+
+    seat_note = (
+        "Seat selection: included." if seat_free
+        else "Seat selection: standard from USD 12. Preferred seats from USD 60. Free at check-in."
+    )
+
+    return {"carry_on": bag_note, "seat": seat_note}
+
+
 class QatarConnectorClient:
     """Qatar Airways CDP Chrome connector — /dapi BFF flight-offers API."""
 
@@ -209,8 +263,46 @@ class QatarConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(anc_origin, anc_dest, req.date_from.isoformat(), req.adults, ob_result.currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("Ancillary fetch timed out for %s\u2192%s", anc_origin, anc_dest)
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", anc_origin, anc_dest, _anc_err)
         return ob_result
 
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        # Qatar includes checked bag on Economy fares.
+        return {
+            "bags_note": "1 checked bag included (23 kg Economy). Carry-on 7 kg included.",
+            "seat_note": "Seat selection: standard from USD 12. Preferred seats from USD 60. Free at check-in.",
+            "bags_from": None,
+            "currency": currency,
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
         global _homepage_warmed
@@ -427,9 +519,10 @@ class QatarConnectorClient:
                 stopovers=stopovers,
             )
 
-            # Take the cheapest economy fare offer
+            # Take the cheapest economy fare offer — capture fareFamily for live bag data
             best_price = None
             best_currency = "QAR"
+            best_fare_obj: dict = {}
             for fare in fare_offers:
                 cabin = fare.get("cabinType", "")
                 if cabin not in ("ECONOMY", "PREMIUM"):
@@ -439,6 +532,7 @@ class QatarConnectorClient:
                 if total and (best_price is None or total < best_price):
                     best_price = total
                     best_currency = price_obj.get("currencyCode", "QAR")
+                    best_fare_obj = fare
 
             # If no economy fare, take the overall cheapest
             if best_price is None:
@@ -448,6 +542,7 @@ class QatarConnectorClient:
                     if total and (best_price is None or total < best_price):
                         best_price = total
                         best_currency = price_obj.get("currencyCode", "QAR")
+                        best_fare_obj = fare
 
             if not best_price or best_price <= 0:
                 continue
@@ -465,7 +560,7 @@ class QatarConnectorClient:
                 )
                 offer_id = hashlib.md5(offer_key.encode()).hexdigest()[:12]
                 all_airlines = list({s.airline for s in segments})
-
+                _qr_conds = _extract_qr_ancillaries(best_fare_obj)
                 ob_offers.append(
                     FlightOffer(
                         id=f"qr_{offer_id}",
@@ -481,6 +576,7 @@ class QatarConnectorClient:
                         is_locked=False,
                         source="qatar_direct",
                         source_tier="free",
+                        conditions=_qr_conds,
                     )
                 )
 
@@ -504,6 +600,7 @@ class QatarConnectorClient:
                     is_locked=False,
                     source="qatar_direct",
                     source_tier="free",
+                    conditions=ob.conditions,
                 ))
             # RT + OW for combo engine
             return rt_offers + ob_offers

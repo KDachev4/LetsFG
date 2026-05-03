@@ -38,6 +38,9 @@ from .browser import auto_block_if_proxied
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800
+
 _SEARCH_URL_TPL = (
     "https://www.flybreeze.com/booking/availability"
     "?origin={origin}&destination={dest}&beginDate={date}"
@@ -138,6 +141,25 @@ class BreezeConnectorClient:
                     ib_offers = []
                 if ib_offers:
                     ob_offers = self._combine_rt(ob_offers, ib_offers, req)
+
+            if ob_offers:
+                segs = ob_offers[0].outbound.segments if ob_offers[0].outbound else []
+                anc_origin = segs[0].origin if segs else req.origin
+                anc_dest = segs[-1].destination if segs else req.destination
+                try:
+                    ancillary = await asyncio.wait_for(
+                        self._fetch_ancillaries(
+                            anc_origin, anc_dest,
+                            req.date_from.isoformat(), req.adults, "USD",
+                        ),
+                        timeout=10.0,
+                    )
+                    if ancillary:
+                        self._apply_ancillaries(ob_offers, ancillary)
+                except (asyncio.TimeoutError, TimeoutError):
+                    pass
+                except Exception as _anc_err:
+                    logger.debug("MX: ancillary fetch error: %s", _anc_err)
 
             return FlightSearchResponse(
                 origin=req.origin,
@@ -409,3 +431,58 @@ class BreezeConnectorClient:
             total_results=0,
             search_id=f"breeze_{req.origin}_{req.destination}_{req.date_from}_{req.return_from or ''}",
         )
+
+    # ------------------------------------------------------------------
+    # Ancillary pricing
+    # ------------------------------------------------------------------
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        cache_key = f"mx_{origin}_{dest}_{date_str}"
+        now = time.time()
+        if cache_key in _ancillary_cache:
+            ts, cached = _ancillary_cache[cache_key]
+            if now - ts < _ANCILLARY_CACHE_TTL:
+                return cached
+        # Breeze: Nickel/Wander/You fares don't include carry-on or checked bag.
+        # Carry-on from ~$20–$50 depending on fare tier and route.
+        result: dict = {
+            "carry_on_from": 20.0,
+            "carry_on_note": "carry-on from +USD 20 (Breeze Nickel fare — add at booking)",
+            "checked_from": 40.0,
+            "checked_note": "first checked bag from +USD 40 (Nickel fare — add at booking)",
+            "seat_from": 10.0,
+            "seat_note": "seat selection from +USD 10",
+            "currency": "USD",
+        }
+        _ancillary_cache[cache_key] = (now, result)
+        return result
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        carry_on_from = ancillary.get("carry_on_from")
+        carry_on_note = ancillary.get("carry_on_note")
+        checked_from = ancillary.get("checked_from")
+        checked_note = ancillary.get("checked_note")
+        seat_from = ancillary.get("seat_from")
+        seat_note = ancillary.get("seat_note")
+        anc_currency = ancillary.get("currency", "USD")
+        for offer in offers:
+            ccy_ok = offer.currency.upper() == anc_currency.upper()
+            if carry_on_note:
+                offer.conditions["carry_on"] = carry_on_note
+            if checked_note:
+                offer.conditions["checked_bag"] = checked_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if carry_on_from is not None and (carry_on_from == 0.0 or ccy_ok):
+                offer.bags_price["carry_on"] = carry_on_from
+            if checked_from is not None and (checked_from == 0.0 or ccy_ok):
+                offer.bags_price["checked_bag"] = checked_from
+            if seat_from is not None and (seat_from == 0.0 or ccy_ok):
+                offer.bags_price["seat_selection"] = seat_from

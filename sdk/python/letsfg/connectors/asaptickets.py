@@ -410,3 +410,13 @@ class AsapticketsConnectorClient:
                 ))
         combos.sort(key=lambda c: c.price)
         return combos[:20]
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        return None

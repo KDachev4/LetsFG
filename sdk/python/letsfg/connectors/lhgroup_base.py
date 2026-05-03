@@ -12,6 +12,7 @@ booking URL pattern, and source identifier.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -150,6 +151,9 @@ IATA_TO_SLUG: dict[str, str] = {
 }
 
 _BASE_URL = "https://www.lufthansa.com/xx/en/flights"
+
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 
 _HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -301,7 +305,7 @@ class LHGroupBaseConnector:
             h = hashlib.md5(
                 f"{self.AIRLINE_CODE}{req.origin}{req.destination}{req.date_from}".encode()
             ).hexdigest()[:12]
-            return FlightSearchResponse(
+            _ob_result = FlightSearchResponse(
                 search_id=f"{self.AIRLINE_CODE.lower()}_{h}",
                 origin=req.origin,
                 destination=req.destination,
@@ -309,6 +313,19 @@ class LHGroupBaseConnector:
                 offers=offers,
                 total_results=len(offers),
             )
+            if _ob_result.offers:
+                try:
+                    _anc = await asyncio.wait_for(
+                        self._fetch_ancillaries(req.origin, req.destination, req.date_from.isoformat(), req.adults, _ob_result.currency),
+                        timeout=45.0,
+                    )
+                    if _anc:
+                        self._apply_ancillaries(_ob_result.offers, _anc)
+                except (asyncio.TimeoutError, TimeoutError):
+                    pass
+                except Exception as _anc_err:
+                    logger.debug("Ancillary fetch error %s->%s: %s", req.origin, req.destination, _anc_err)
+            return _ob_result
 
         except Exception as e:
             logger.error("%s error: %s", self.AIRLINE_NAME, e)
@@ -505,3 +522,47 @@ class LHGroupBaseConnector:
             offers=[],
             total_results=0,
         )
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        global _ancillary_cache
+        cache_key = f"{self.AIRLINE_CODE}:{origin}:{dest}"
+        now = time.monotonic()
+        if cache_key in _ancillary_cache:
+            ts, data = _ancillary_cache[cache_key]
+            if now - ts < _ANCILLARY_CACHE_TTL:
+                return data
+        result: dict = {
+            "bags_note": (
+                "Economy Light (starting fare): no checked bag, "
+                f"first bag from {self.DEFAULT_CURRENCY} 15\u201325. "
+                "Economy Classic/Flex: 1\u00d723 kg included."
+            ),
+            "seat_note": (
+                f"Seat selection: from {self.DEFAULT_CURRENCY} 10 (Light). "
+                "Included in Classic/Flex fares."
+            ),
+            "bags_from": None,
+            "currency": self.DEFAULT_CURRENCY,
+        }
+        _ancillary_cache[cache_key] = (now, result)
+        return result
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note", "")
+        seat_note = ancillary.get("seat_note", "")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", self.DEFAULT_CURRENCY)
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency == anc_currency:
+                offer.bags_price["carry_on"] = bags_from

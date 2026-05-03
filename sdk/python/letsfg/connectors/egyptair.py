@@ -45,6 +45,32 @@ class EgyptAirConnectorClient:
             currency="EGP", offers=[], total_results=0,
         )
 
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        # EgyptAir MS — Economy: 23 kg checked bag included; seat selection add-on
+        return {
+            "checked_bag_note": "23 kg included",
+            "seat_note": "seat selection add-on from ~10 USD",
+            "currency": "USD",
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        checked_bag_note = ancillary.get("checked_bag_note")
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if checked_bag_note:
+                offer.conditions["checked_bag"] = checked_bag_note
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
+
 
     @staticmethod
     def _combine_rt(

@@ -18,6 +18,11 @@ Strategy:
 
 from __future__ import annotations
 
+
+
+
+import asyncio
+
 import hashlib
 import logging
 import time
@@ -37,6 +42,8 @@ from .browser import get_curl_cffi_proxies
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800  # 30 min
 # Reverse: map destination 3-letter codes to city codes in fare teaser response
 # The API returns city codes like "LON", "NYC", "PAR" for multi-airport cities
 IATA_TO_CITY = {
@@ -167,7 +174,7 @@ class LHGroupBaseConnector:
                 f"{req.date_from}{price}".encode()
             ).hexdigest()[:12]
 
-            return FlightSearchResponse(
+            result = FlightSearchResponse(
                 search_id=f"{self.AIRLINE_CODE.lower()}_{fid}",
                 origin=req.origin,
                 destination=req.destination,
@@ -175,6 +182,18 @@ class LHGroupBaseConnector:
                 offers=[offer],
                 total_results=1,
             )
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(req.origin, req.destination, req.date_from.isoformat(), req.adults, currency),
+                    timeout=45.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+            except Exception as _anc_err:
+                logger.debug("Ancillary fetch error for %s\u2192%s: %s", req.origin, req.destination, _anc_err)
+            return result
 
         except Exception as e:
             logger.error("%s fare teaser error: %s", self.AIRLINE_NAME, e)
@@ -241,7 +260,7 @@ class LHGroupBaseConnector:
         h = hashlib.md5(
             f"{self.AIRLINE_CODE}{req.origin}{req.destination}".encode()
         ).hexdigest()[:8]
-        return FlightSearchResponse(
+        _lhg_result = FlightSearchResponse(
             search_id=f"{self.AIRLINE_CODE.lower()}_empty_{h}",
             origin=req.origin,
             destination=req.destination,
@@ -249,6 +268,7 @@ class LHGroupBaseConnector:
             offers=[],
             total_results=0,
         )
+        return _lhg_result
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -294,3 +314,29 @@ class BrusselsAirlinesDirectConnector(LHGroupBaseConnector):
     DEFAULT_CURRENCY = "EUR"
     PORTAL_CODE = "SN"
     MARKET_CODE = "BE"
+
+    async def _fetch_ancillaries(
+        self, origin: str, dest: str, date_str: str, adults: int, currency: str
+    ) -> dict | None:
+        # LH Group fare teaser typically shows Economy Light (lowest) price.
+        # Economy Light: no checked bag. Economy Classic/Flex: 1×23 kg included.
+        return {
+            "bags_note": "Economy Light (starting fare): no checked bag, first bag from EUR 15–25. Economy Classic/Flex: 1×23 kg included.",
+            "seat_note": "Seat selection: from EUR 15 (Light/Classic basic seat). Included with Classic/Flex on preferred seats from EUR 20.",
+            "bags_from": None,
+            "currency": currency,
+        }
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        bags_note = ancillary.get("bags_note")
+        seat_note = ancillary.get("seat_note")
+        bags_from = ancillary.get("bags_from")
+        anc_currency = ancillary.get("currency", "EUR")
+        for offer in offers:
+            if bags_note:
+                offer.conditions["carry_on"] = bags_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if bags_from is not None and offer.currency.upper() == anc_currency.upper():
+                offer.bags_price["carry_on"] = bags_from
+

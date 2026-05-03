@@ -487,3 +487,13 @@ def _parse_cheapoair(data: dict, req: FlightSearchRequest) -> list[FlightOffer]:
             continue
 
     return offers
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        return None

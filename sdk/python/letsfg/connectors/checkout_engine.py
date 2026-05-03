@@ -4047,6 +4047,9 @@ class GenericCheckoutEngine:
         if not await _robust_fill_airport(origin, True):
             logger.warning("JetSMART checkout: could not fill origin %s", origin)
             return False
+        # Diagnostic: confirm origin input value after _fill_airport
+        _orig_val = await page.evaluate("() => (document.querySelector('input[placeholder=\"Origen\"]') || {}).value || ''")
+        logger.warning("JetSMART checkout: origin input value after _fill_airport: %r", _orig_val)
 
         _js_city_map = {
             "SCL": "Santiago", "IQQ": "Iquique", "ANF": "Antofagasta", "CJC": "Calama",
@@ -4061,35 +4064,409 @@ class GenericCheckoutEngine:
         _dest_city = _js_city_map.get(destination, destination)
 
         # ── Destination fill ─────────────────────────────────────────────
-        # Delegate to _fill_airport (same logic as search connector):
-        # focus → remove promo overlay → type IATA → click visible cursor-pointer li
-        await page.wait_for_timeout(800)
-        _dest_ok = await helper._fill_airport(page, destination, is_origin=False)
-        logger.warning("JetSMART checkout: dest _fill_airport result: %s", _dest_ok)
+        # History:
+        # - CDP mouse.click(394, 221) → hits sticky nav bar (run 100)
+        # - page.locator().click() → times out even with nav hidden (runs 101-102)
+        # - CDP click at coords after nav-hide → y=400 (Playwright scrolled it
+        #   during timeout attempt) but dropdown still didn't open
+        # New hypothesis: destination dropdown AUTO-OPENS after origin selection.
+        # If we then try to click Destino, we CLOSE it (toggle). After that nothing
+        # appears. Run 103: check auto-open state FIRST, skip any click if open.
+        # Fallback: Tab key from origin (triggers focus handler on Destino).
+        await asyncio.sleep(1.5)  # wait longer for auto-open animation
 
-        # Wait 1.5s for calendar to auto-open after destination selection (same as search connector)
-        await page.wait_for_timeout(1500)
+        _dest_filled = False
+        _nav_keys = ['Reserva', 'Beneficios', 'viaje', 'Vuelos', 'Admin', 'Oferta', 'Destinos', 'SMART']
 
-        # Verify destination value
-        _dest_val = await page.evaluate("""() => {
-            return (document.querySelector('input[placeholder="Destino"]') || {}).value || '';
+        def _is_nav_only(sample):
+            if not sample:
+                return True
+            return all(any(n in t for n in _nav_keys) for t in sample)
+
+        # Step 1: Check if destination dropdown already auto-opened after origin
+        _auto_open = await page.evaluate("""([iata, city]) => {
+            const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+            const allLis = Array.from(document.querySelectorAll('li')).filter(vis);
+            const cpLis = allLis.filter(l => (l.className || '').includes('cursor-pointer'));
+            const tgt = allLis.find(l => { const t = (l.textContent||'').replace(/\s+/g,' ').trim(); return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase()); });
+            const inpR = (() => { const i = document.querySelector('input[placeholder="Destino"]'); return i ? i.getBoundingClientRect() : null; })();
+            return {total: allLis.length, cpCount: cpLis.length,
+                cpSample: cpLis.slice(0,8).map(l => (l.textContent||'').replace(/\s+/g,' ').trim().slice(0,35)),
+                pmcFound: !!tgt,
+                inpY: inpR ? inpR.top + inpR.height/2 : 0};
+        }""", [destination, _dest_city])
+        logger.warning("JetSMART checkout: dest AUTO-OPEN check (before any click): %s", _auto_open)
+
+        _dropdown_open = _auto_open.get('cpCount', 0) > 0 and not _is_nav_only(_auto_open.get('cpSample', []))
+
+        if not _dropdown_open:
+            # Step 2a: Try Tab key from current focus — triggers Vue focus handler on Destino
+            logger.warning("JetSMART checkout: dropdown not auto-open, trying Tab key")
+            await page.keyboard.press("Tab")
+            await asyncio.sleep(1.5)
+            _after_tab = await page.evaluate("""([iata, city]) => {
+                const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+                const allLis = Array.from(document.querySelectorAll('li')).filter(vis);
+                const cpLis = allLis.filter(l => (l.className || '').includes('cursor-pointer'));
+                const tgt = allLis.find(l => { const t = (l.textContent||'').replace(/\s+/g,' ').trim(); return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase()); });
+                return {total: allLis.length, cpCount: cpLis.length,
+                    cpSample: cpLis.slice(0,8).map(l => (l.textContent||'').replace(/\s+/g,' ').trim().slice(0,35)),
+                    pmcFound: !!tgt};
+            }""", [destination, _dest_city])
+            logger.warning("JetSMART checkout: dest after Tab key: %s", _after_tab)
+            if _after_tab.get('cpCount', 0) > 0 and not _is_nav_only(_after_tab.get('cpSample', [])):
+                _dropdown_open = True
+                _auto_open = _after_tab
+
+        if not _dropdown_open:
+            # Step 2b: hide nav + CDP click at actual input coordinates
+            logger.warning("JetSMART checkout: Tab didn't open dropdown, trying nav-hide + CDP click")
+            _inp_coords_before = await page.evaluate("""() => {
+                const i = document.querySelector('input[placeholder="Destino"]');
+                if (!i) return null;
+                const r = i.getBoundingClientRect();
+                const cov = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2);
+                return {x: r.left + r.width/2, y: r.top + r.height/2, covTag: cov ? cov.tagName : 'none', covCls: cov ? (cov.className||'').slice(0,40) : ''};
+            }""")
+            logger.warning("JetSMART checkout: dest input coords + covering elem: %s", _inp_coords_before)
+            # Hide sticky nav/header
+            await page.evaluate("""() => {
+                for (const n of document.querySelectorAll('header, nav, [class*="navbar"], [class*="header"]')) {
+                    const r = n.getBoundingClientRect();
+                    if (r.top < 10 && r.height > 20) {
+                        n.dataset._savedVis = n.style.visibility;
+                        n.style.visibility = 'hidden';
+                    }
+                }
+            }""")
+            await asyncio.sleep(0.2)
+            if _inp_coords_before:
+                await page.mouse.click(_inp_coords_before['x'], _inp_coords_before['y'])
+                logger.warning("JetSMART checkout: CDP click at dest (nav hidden): %s", _inp_coords_before)
+            # Restore nav
+            await page.evaluate("""() => {
+                for (const n of document.querySelectorAll('header, nav, [class*="navbar"], [class*="header"]')) {
+                    if (n.dataset._savedVis !== undefined) {
+                        n.style.visibility = n.dataset._savedVis;
+                        delete n.dataset._savedVis;
+                    }
+                }
+            }""")
+            await asyncio.sleep(1.5)
+            _after_hide_click = await page.evaluate("""([iata, city]) => {
+                const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+                const allLis = Array.from(document.querySelectorAll('li')).filter(vis);
+                const cpLis = allLis.filter(l => (l.className || '').includes('cursor-pointer'));
+                const tgt = allLis.find(l => { const t = (l.textContent||'').replace(/\s+/g,' ').trim(); return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase()); });
+                return {total: allLis.length, cpCount: cpLis.length,
+                    cpSample: cpLis.slice(0,8).map(l => (l.textContent||'').replace(/\s+/g,' ').trim().slice(0,35)),
+                    pmcFound: !!tgt};
+            }""", [destination, _dest_city])
+            logger.warning("JetSMART checkout: dest after nav-hide CDP click: %s", _after_hide_click)
+            if _after_hide_click.get('cpCount', 0) > 0 and not _is_nav_only(_after_hide_click.get('cpSample', [])):
+                _dropdown_open = True
+                _auto_open = _after_hide_click
+
+        # Step 3: if dropdown is open, click PMC li directly
+        if _dropdown_open:
+            _pmc_li = await page.evaluate("""([iata, city]) => {
+                const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+                const lis = Array.from(document.querySelectorAll('li')).filter(vis);
+                const tgt = lis.find(l => { const t = (l.textContent||'').replace(/\s+/g,' ').trim(); return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase()); });
+                if (!tgt) return {found: false, total: lis.length};
+                const r = tgt.getBoundingClientRect();
+                return {found: true, x: r.left + r.width/2, y: r.top + r.height/2, h: r.height, text: (tgt.textContent||'').trim().slice(0,40)};
+            }""", [destination, _dest_city])
+            logger.warning("JetSMART checkout: PMC li in open dropdown: %s", _pmc_li)
+            if _pmc_li.get('found') and _pmc_li.get('h', 0) > 0:
+                await page.mouse.click(_pmc_li['x'], _pmc_li['y'])
+                await asyncio.sleep(0.8)
+                _v = await page.evaluate("() => (document.querySelector('input[placeholder=\"Destino\"]') || {}).value || ''")
+                logger.warning("JetSMART checkout: destino after PMC click: %r", _v)
+                if _v and _v.strip() and _v.strip().upper() not in ('PMC', ''):
+                    _dest_filled = True
+
+        # Step 4: open Destino dropdown, first try clicking PMC directly from unfiltered list,
+        # then fall back to typing city name. 
+        # KEY BUG (run 117): Ctrl+A+Backspace was clearing the ORIGIN field (focus stays on
+        # origin after _fill_airport's LI click). Without origin committed, Destino autocomplete
+        # has no route context → "No hay resultados" for any city name.
+        # Fix: Remove Ctrl+A+Backspace. Open Destino dropdown and try PMC from unfiltered list.
+        if not _dest_filled:
+            logger.warning("JetSMART checkout: no dropdown PMC click, trying type autocomplete")
+            # Log current origin value to confirm it's still set
+            _orig_before_dest = await page.evaluate("() => (document.querySelector('input[placeholder=\"Origen\"]') || {}).value || ''")
+            logger.warning("JetSMART checkout: origin val before dest step4: %r", _orig_before_dest)
+            # DO NOT press Ctrl+A+Backspace here — that was clearing the origin field!
+            # JS-click inputs[1] to open Vue's destination dropdown.
+            await page.evaluate("""() => {
+                const vis = (el) => !!(el.offsetWidth || el.offsetHeight);
+                const inputs = Array.from(document.querySelectorAll('input'))
+                    .filter(i => vis(i) && (!i.type || i.type === 'text'));
+                const t = inputs[1];
+                if (t) { t.focus(); t.click(); }
+            }""")
+            await asyncio.sleep(2.0)
+            # Log unfiltered dropdown state: if PMC is here, click directly without typing
+            _unfiltered = await page.evaluate("""([iata, city]) => {
+                const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+                const normalize = (s) => s.replace(/\\s+/g, ' ').trim();
+                const allLis = Array.from(document.querySelectorAll('li')).filter(vis)
+                    .filter(l => (l.className||'').includes('cursor-pointer'));
+                const pmcLis = allLis.filter(li => {
+                    const t = normalize(li.textContent||'');
+                    return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase());
+                });
+                return {
+                    cpCount: allLis.length,
+                    cpSample: allLis.slice(0,8).map(l => normalize(l.textContent||'').slice(0,35)),
+                    pmcFound: pmcLis.length > 0,
+                    pmcText: pmcLis.map(l => normalize(l.textContent||'').slice(0,35)),
+                };
+            }""", [destination, _dest_city])
+            logger.warning("JetSMART checkout: unfiltered dropdown state: %s", _unfiltered)
+
+            # Strategy A: click PMC directly from the unfiltered list (no typing needed)
+            if _unfiltered.get('pmcFound'):
+                _clicked_pmc = await page.evaluate("""([iata, city]) => {
+                    const normalize = (s) => s.replace(/\\s+/g, ' ').trim();
+                    const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+                    const inputs = Array.from(document.querySelectorAll('input'))
+                        .filter(i => vis(i) && (!i.type || i.type === 'text'));
+                    const destInput = inputs[1];
+                    const destRect = destInput ? destInput.getBoundingClientRect() : null;
+                    const allLis = Array.from(document.querySelectorAll('li')).filter(vis)
+                        .filter(l => (l.className||'').includes('cursor-pointer'));
+                    const pmcLis = allLis.filter(li => {
+                        const t = normalize(li.textContent||'');
+                        return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase());
+                    }).sort((a, b) => {
+                        if (!destRect) return 0;
+                        const ar = a.getBoundingClientRect(), br = b.getBoundingClientRect();
+                        return (Math.abs(ar.top - destRect.bottom) + Math.abs(ar.left - destRect.left))
+                             - (Math.abs(br.top - destRect.bottom) + Math.abs(br.left - destRect.left));
+                    });
+                    const tgt = pmcLis[0];
+                    if (!tgt) return false;
+                    tgt.click();
+                    return normalize(tgt.textContent||'').slice(0,40);
+                }""", [destination, _dest_city])
+                logger.warning("JetSMART checkout: direct PMC click from unfiltered list: %r", _clicked_pmc)
+                await asyncio.sleep(1.5)
+                _v_direct = await page.evaluate("() => (document.querySelector('input[placeholder=\"Destino\"]') || {}).value || ''")
+                logger.warning("JetSMART checkout: destVal after direct PMC click: %r", _v_direct)
+                if _v_direct and _v_direct.strip():
+                    _dest_filled = True
+            
+            # Strategy B: type city name to filter (only if direct click didn't work)
+            if not _dest_filled:
+                logger.warning("JetSMART checkout: PMC not in unfiltered list or direct click failed, typing city name")
+                await page.keyboard.type(_dest_city, delay=120)
+                await asyncio.sleep(3.5)
+
+                # Log dropdown state BEFORE clicking so we know if filter worked.
+                _pre_click = await page.evaluate("""([iata, city]) => {
+                    const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+                    const normalize = (s) => s.replace(/\\s+/g, ' ').trim();
+                    const allLis = Array.from(document.querySelectorAll('li')).filter(vis);
+                    const pmcLis = allLis.filter(li => {
+                        const t = normalize(li.textContent||'');
+                        return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase());
+                    }).sort((a,b) => a.getBoundingClientRect().height - b.getBoundingClientRect().height);
+                    const zDivs = Array.from(document.querySelectorAll('div[class*="z-["]')).filter(d => d.offsetHeight > 0);
+                    return {
+                        totalLis: allLis.length,
+                        pmcCount: pmcLis.length,
+                        pmcHeights: pmcLis.slice(0,3).map(l => Math.round(l.getBoundingClientRect().height)),
+                        zDivTexts: zDivs.slice(0,5).map(d => (d.innerText||'').replace(/\\s+/g,' ').trim().slice(0,50)),
+                    };
+                }""", [destination, _dest_city])
+                logger.warning("JetSMART checkout: pre-CDP-click state: %s", _pre_click)
+
+            # Find LI inside the booking dropdown container (after typing filtered it).
+            # Also used if strategy A (unfiltered click) didn't work.
+            if not _dest_filled:
+                _li_coords = await page.evaluate("""([iata, city]) => {
+                const vis = (el) => { const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length); };
+                const normalize = (s) => s.replace(/\\s+/g, ' ').trim();
+                // Find the booking dropdown container first
+                let container = null;
+                for (const dd of Array.from(document.querySelectorAll('div'))) {
+                    const cls = dd.className || '';
+                    if (cls.includes('min-w-52') && cls.includes('select-none') && dd.offsetHeight > 0) {
+                        container = dd; break;
+                    }
+                }
+                const searchRoot = container || document;
+                const allLis = Array.from(searchRoot.querySelectorAll('li')).filter(vis);
+                const pmcLis = allLis.filter(li => {
+                    const t = normalize(li.textContent||'');
+                    return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase());
+                }).sort((a,b) => a.getBoundingClientRect().height - b.getBoundingClientRect().height);
+                const tgt = pmcLis[0];
+                if (!tgt) return null;
+                tgt.scrollIntoView({block: 'nearest', behavior: 'instant'});
+                const r = tgt.getBoundingClientRect();
+                // Find innermost interactive child (button/a/[role]) — Vue @click is often there
+                const inner = tgt.querySelector('button, a, [role="option"]');
+                const innerR = inner ? inner.getBoundingClientRect() : null;
+                return {x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+                    h: Math.round(r.height), cls: (tgt.className||'').slice(0,50),
+                    text: normalize(tgt.textContent||'').slice(0,40),
+                    inContainer: !!container,
+                    innerTag: inner ? inner.tagName : null,
+                    innerText: inner ? normalize(inner.textContent||'').slice(0,30) : null,
+                    innerY: innerR ? Math.round(innerR.top + innerR.height/2) : null,
+                    innerHTML: tgt.innerHTML.slice(0, 200)};
+            }""", [destination, _dest_city])
+            logger.warning("JetSMART checkout: PMC LI info: %s", _li_coords)
+
+            if _li_coords and _li_coords.get('y', 0) > 0:
+                _li_text = (_li_coords.get('text') or '').strip()
+                _inner_tag = _li_coords.get('innerTag')
+                _inner_text = (_li_coords.get('innerText') or '').strip()
+                _clicked = False
+                # Strategy A: click the inner interactive child (button/a) — Vue @click is often there
+                if _inner_tag and _inner_text:
+                    try:
+                        _inner_sel = f"{_inner_tag.lower()}".lower()
+                        await page.locator('li').filter(has_text=_li_text).locator(_inner_sel).first.click(force=True, timeout=4000)
+                        logger.warning("JetSMART checkout: inner %s force-click succeeded (text=%r)", _inner_tag, _inner_text)
+                        _clicked = True
+                    except Exception as _ie:
+                        logger.warning("JetSMART checkout: inner %s click failed: %s", _inner_tag, _ie)
+                # Strategy B: click the LI itself with force=True
+                if not _clicked:
+                    try:
+                        await page.locator('li').filter(has_text=_li_text).first.click(force=True, timeout=5000)
+                        logger.warning("JetSMART checkout: LI force-click succeeded (text=%r)", _li_text)
+                        _clicked = True
+                    except Exception as _lce:
+                        logger.warning("JetSMART checkout: LI force-click failed: %s", _lce)
+                # Strategy C: JS dispatchEvent (all 3: pointerdown+mousedown+click) on the LI
+                if not _clicked:
+                    await page.evaluate("""([iata, city]) => {
+                        const normalize = (s) => s.replace(/\\s+/g,' ').trim();
+                        const allLis = Array.from(document.querySelectorAll('li'));
+                        const tgt = allLis.find(l => {
+                            const t = normalize(l.textContent||'');
+                            return t.includes(iata) || t.toLowerCase().includes(city.toLowerCase());
+                        });
+                        if (tgt) {
+                            const fireOn = tgt.querySelector('button, a') || tgt;
+                            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(ev =>
+                                fireOn.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true, view:window}))
+                            );
+                        }
+                    }""", [destination, _dest_city])
+                    logger.warning("JetSMART checkout: dispatchEvent fallback fired")
+                await asyncio.sleep(1.5)
+                _v2 = await page.evaluate("() => (document.querySelector('input[placeholder=\"Destino\"]') || {}).value || ''")
+                _cp_after = await page.evaluate("""() => {
+                    const vis = (el) => !!(el.offsetWidth || el.offsetHeight);
+                    return Array.from(document.querySelectorAll('li')).filter(vis)
+                        .filter(l => (l.className||'').includes('cursor-pointer')).length;
+                }""")
+                logger.warning("JetSMART checkout: after force-click on PMC LI: destVal=%r cpCount=%d", _v2, _cp_after)
+                # Dropdown still open (cpCount>20)? Press Escape to close it.
+                if _cp_after > 20:
+                    await page.keyboard.press('Escape')
+                    await asyncio.sleep(0.5)
+                    _v2 = await page.evaluate("() => (document.querySelector('input[placeholder=\"Destino\"]') || {}).value || ''")
+                    logger.warning("JetSMART checkout: destVal after Escape: %r", _v2)
+                await page.evaluate("() => window.scrollTo(0, 0)")
+                await asyncio.sleep(0.3)
+                if _v2 and _v2.strip():
+                    _dest_filled = True
+                    logger.warning("JetSMART checkout: PMC filled (cpCount=%d, val=%r)", _cp_after, _v2)
+            else:
+                logger.warning("JetSMART checkout: could not get PMC LI coords, trying Enter fallback")
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.5)
+                _vf2 = await page.evaluate("() => (document.querySelector('input[placeholder=\"Destino\"]') || {}).value || ''")
+                if _vf2 and _vf2.strip():
+                    _dest_filled = True
+
+        if not _dest_filled:
+            logger.warning("JetSMART checkout: all approaches failed, falling back to _fill_airport")
+            await helper._fill_airport(page, destination, is_origin=False)
+            _vf = await page.evaluate("() => (document.querySelector('input[placeholder=\"Destino\"]') || {}).value || ''")
+            logger.warning("JetSMART checkout: destino after _fill_airport: %r", _vf)
+
+        # After destination fill, check Vue component state and whether calendar auto-opened.
+        # Diagnostic: click Search without a date to see what Vue validation fires.
+        await asyncio.sleep(1.0)
+        _cal_after_dest = await page.evaluate("""() => {
+            const allDD = Array.from(document.querySelectorAll('div[class*="z-["]')).filter(d => d.offsetHeight > 0);
+            const anyLarge = Array.from(document.querySelectorAll('div')).filter(d => {
+                const r = d.getBoundingClientRect(); return r.width > 200 && r.height > 150 && d.offsetHeight > 0;
+            });
+            const hasManyDays = (el) => Array.from(el.querySelectorAll('*')).filter(d =>
+                d.children.length === 0 && /^[0-9]{1,2}$/.test((d.textContent||'').trim())
+                && d.offsetHeight > 0 && d.offsetHeight <= 50 && d.offsetWidth <= 50).length >= 20;
+            const cal = [...allDD, ...anyLarge].find(hasManyDays);
+            // Also check form input values  
+            const inputs = Array.from(document.querySelectorAll('input')).filter(i => i.offsetHeight);
+            const vals = inputs.slice(0,4).map(i => ({ph: i.placeholder, val: (i.value||'').slice(0,20)}));
+            return {calFound: !!cal, calText: cal ? (cal.innerText||'').slice(0,60) : '', inputs: vals};
         }""")
-        logger.warning("JetSMART checkout: destino after _fill_airport: %s", _dest_val)
+        logger.warning("JetSMART checkout: state after dest fill: %s", _cal_after_dest)
 
-        # Fill departure date — _fill_date will open calendar if not already open
+        # Try clicking the search button WITHOUT date to observe Vue's validation error.
+        # If Vue says "select date" (not "select origin/destination"), they're committed.
+        _search_diag = await page.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button, div[class*="cursor-pointer"]'));
+            const buscar = btns.find(b => {
+                const t = (b.innerText||b.textContent||'').trim().toLowerCase();
+                return t.includes('buscar') || t.includes('search') || t === 'buscar vuelos';
+            });
+            if (buscar) { buscar.click(); return 'clicked:' + (buscar.innerText||'').trim().slice(0,30); }
+            return 'not_found';
+        }""")
+        logger.warning("JetSMART checkout: search diag click: %s", _search_diag)
+        await asyncio.sleep(1.0)
+        _validation_msgs = await page.evaluate("""() => {
+            // Find validation error messages / tooltips
+            const msgs = [];
+            for (const el of document.querySelectorAll('[class*="error"], [class*="invalid"], [class*="tooltip"], [class*="alert"], [role="alert"]')) {
+                const t = (el.innerText||el.textContent||'').trim();
+                if (t && t.length < 200 && el.offsetHeight > 0) msgs.push(t.slice(0,80));
+            }
+            // Also check for red text or warning colors
+            const url = window.location.href;
+            return {msgs: msgs.slice(0,5), url: url.slice(0,100)};
+        }""")
+        logger.warning("JetSMART checkout: validation after search click: %s", _validation_msgs)
+
+        # After destination is committed in Vue, calendar often auto-opens.
+
+        # Force-close any destinations autocomplete overlay before clicking date input.
+        # After typing city name, the overlay class is 'fixed min-w-52 select-none overflow-hidd'
+        # and text changes from 'Todos los destinos' to results/no-results — match by class.
+        await page.evaluate("""() => {
+            for (const dd of Array.from(document.querySelectorAll('div'))) {
+                const cls = dd.className || '';
+                if ((cls.includes('min-w-52') || cls.includes('select-none'))
+                    && dd.offsetHeight > 0) {
+                    dd.remove();
+                }
+            }
+        }""")
+        await asyncio.sleep(0.3)
+
+        # Fill departure date — _fill_date handles calendar open internally
         import types as _types
         _req_mock = _types.SimpleNamespace(date_from=target_date)
-        # Log calendar state (diagnostic only — do NOT remove overlays here)
         _cal_state = await page.evaluate("""() => {
-            const allDD = Array.from(document.querySelectorAll('div[class*="z-[9999]"]'));
-            const cal = allDD.find(dd => Array.from(dd.querySelectorAll('div')).some(
-                d => d.children.length === 0 && d.offsetHeight > 0 && /^[0-9]{1,2}$/.test(d.textContent.trim())
-            ));
-            if (!cal) {
-                // Also check if there's any overlay at all
-                return 'not_open (overlays=' + allDD.length + ' text=' + (allDD[0] ? (allDD[0].innerText||'').slice(0,40) : 'none') + ')';
-            }
-            return 'open:' + (cal.innerText || '').replace(/\s+/g,' ').trim().slice(0, 60);
+            const allDD = Array.from(document.querySelectorAll('div[class*="z-["]')).filter(d => d.offsetHeight > 0);
+            const cal = allDD.find(dd => {
+                const cells = Array.from(dd.querySelectorAll('*')).filter(d =>
+                    d.children.length === 0 && /^[0-9]{1,2}$/.test((d.textContent||'').trim())
+                    && d.offsetHeight > 0 && d.offsetHeight <= 50 && d.offsetWidth <= 50);
+                return cells.length >= 20;
+            });
+            if (!cal) return 'not_open (overlays=' + allDD.length + ' classes=' + allDD.slice(0,2).map(d=>(d.className||'').slice(0,40)).join('|') + ')';
+            return 'open:' + (cal.innerText || '').replace(/\\s+/g,' ').trim().slice(0, 60);
         }""")
         logger.warning("JetSMART checkout: calendar state before _fill_date: %s", _cal_state)
         _date_ok = await helper._fill_date(page, _req_mock)

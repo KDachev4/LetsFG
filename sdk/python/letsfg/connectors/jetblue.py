@@ -49,6 +49,9 @@ from .browser import auto_block_if_proxied
 
 logger = logging.getLogger(__name__)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800
+
 _BEST_FARES_URL = "https://jbrest.jetblue.com/bff-service-v2/bestFares/"
 _BOOKING_URL_TPL = (
     "https://www.jetblue.com/booking/flights"
@@ -146,6 +149,24 @@ class JetBlueConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(
+                        anc_origin, anc_dest,
+                        req.date_from.isoformat(), req.adults, "USD",
+                    ),
+                    timeout=10.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+            except Exception as _anc_err:
+                logger.debug("B6: ancillary fetch error: %s", _anc_err)
         return ob_result
 
     async def _search_ow(self, req: FlightSearchRequest) -> FlightSearchResponse:
@@ -534,6 +555,61 @@ class JetBlueConnectorClient:
             offers=[],
             total_results=0,
         )
+
+    # ------------------------------------------------------------------
+    # Ancillary pricing
+    # ------------------------------------------------------------------
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        cache_key = f"b6_{origin}_{dest}_{date_str}"
+        now = time.time()
+        if cache_key in _ancillary_cache:
+            ts, cached = _ancillary_cache[cache_key]
+            if now - ts < _ANCILLARY_CACHE_TTL:
+                return cached
+        # JetBlue: Blue Basic fare has no carry-on or checked bag included.
+        # Carry-on from ~$35, first checked bag ~$35.
+        result: dict = {
+            "carry_on_from": 35.0,
+            "carry_on_note": "carry-on from +USD 35 (Blue Basic — Blue/Extra fares include carry-on)",
+            "checked_from": 35.0,
+            "checked_note": "first checked bag from +USD 35 (Blue Basic — Blue/Extra fares include 1 bag)",
+            "seat_from": 15.0,
+            "seat_note": "seat selection from +USD 15 (Blue Basic)",
+            "currency": "USD",
+        }
+        _ancillary_cache[cache_key] = (now, result)
+        return result
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        carry_on_from = ancillary.get("carry_on_from")
+        carry_on_note = ancillary.get("carry_on_note")
+        checked_from = ancillary.get("checked_from")
+        checked_note = ancillary.get("checked_note")
+        seat_from = ancillary.get("seat_from")
+        seat_note = ancillary.get("seat_note")
+        anc_currency = ancillary.get("currency", "USD")
+        for offer in offers:
+            ccy_ok = offer.currency.upper() == anc_currency.upper()
+            if carry_on_note:
+                offer.conditions["carry_on"] = carry_on_note
+            if checked_note:
+                offer.conditions["checked_bag"] = checked_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if carry_on_from is not None and (carry_on_from == 0.0 or ccy_ok):
+                offer.bags_price["carry_on"] = carry_on_from
+            if checked_from is not None and (checked_from == 0.0 or ccy_ok):
+                offer.bags_price["checked_bag"] = checked_from
+            if seat_from is not None and (seat_from == 0.0 or ccy_ok):
+                offer.bags_price["seat_selection"] = seat_from
 
 
     @staticmethod

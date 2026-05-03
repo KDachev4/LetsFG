@@ -399,3 +399,13 @@ class ByojetConnectorClient:
             search_id=f"fs_{h}", origin=req.origin, destination=req.destination,
             currency="AUD", offers=[], total_results=0,
         )
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        return None

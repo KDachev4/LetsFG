@@ -425,6 +425,70 @@ class PegasusConnectorClient:
                     currency = str(fc)
                     break
 
+        # ── Bag pricing from fare bundles ────────────────────────────
+        # Pegasus fare families: Essential (cabin bag only), Comfort (20kg),
+        # Advantage/Plus (25-30kg). Price diff = bag add-on.
+        _bundle_price_map: dict[str, float] = {}
+        _bundle_bag_kg: dict[str, int] = {}
+        _NO_BAG_NAMES = {"essential", "eco", "light", "promo", "basic", "value", "economy"}
+        _BAG_NAMES = {"comfort", "plus", "advantage", "max", "flexi", "standard", "premium"}
+        for fb in (fare_bundles if isinstance(fare_bundles, list) else []):
+            if not isinstance(fb, dict):
+                continue
+            fb_name = (
+                fb.get("fareBundleName") or fb.get("fareFamilyName") or
+                fb.get("bundleName") or fb.get("fareType") or fb.get("name") or ""
+            ).lower().strip()
+            fb_p = (fb.get("price") or fb.get("amount") or fb.get("totalPrice")
+                    or fb.get("basePrice") or fb.get("adultPrice"))
+            if isinstance(fb_p, dict):
+                fb_p = fb_p.get("amount") or fb_p.get("value")
+            try:
+                fb_price = float(fb_p) if fb_p is not None else None
+            except (TypeError, ValueError):
+                fb_price = None
+            if fb_name and fb_price and fb_price > 0:
+                _bundle_price_map[fb_name] = fb_price
+            # Also try to extract bag kg from baggageAllowance
+            ba = fb.get("baggageAllowance") or fb.get("baggage") or {}
+            if isinstance(ba, dict):
+                kg = (ba.get("checkedBaggageAllowance") or ba.get("checked") or
+                      ba.get("weight") or ba.get("kg") or 0)
+                try:
+                    _bundle_bag_kg[fb_name] = int(float(kg))
+                except (TypeError, ValueError):
+                    pass
+
+        # Identify base (no-bag) and comfort (with-bag) bundle prices
+        _base_price: float | None = None
+        _bag_price: float | None = None
+        _bag_kg = 20  # default assumption
+        for bname, bprice in _bundle_price_map.items():
+            if any(n in bname for n in _NO_BAG_NAMES):
+                if _base_price is None or bprice < _base_price:
+                    _base_price = bprice
+            elif any(n in bname for n in _BAG_NAMES):
+                if _bag_price is None or bprice < _bag_price:
+                    _bag_price = bprice
+                    _bag_kg = _bundle_bag_kg.get(bname, 20)
+
+        _pc_offer_conditions: dict[str, str] = {}
+        _pc_offer_bags: dict = {}
+        if _base_price is not None and _bag_price is not None:
+            _add_on = round(_bag_price - _base_price, 2)
+            if _add_on > 0:
+                _pc_offer_bags["checked"] = _add_on
+                _pc_offer_conditions["checked_bag"] = "not included (Essential fare)"
+                _pc_offer_conditions["carry_on"] = (
+                    f"checked bag ({_bag_kg} kg) from +{_add_on:.2f} {currency}"
+                )
+        elif _bag_price is not None and _base_price is None:
+            # Only bag bundles found — assume cheapest includes bag
+            _pc_offer_conditions["checked_bag"] = f"{_bag_kg} kg included"
+            _pc_offer_bags["checked"] = 0.0
+
+        _pc_offer_conditions["seat"] = "seat selection add-on from ~5 EUR"
+
         # ── Build segments ───────────────────────────────────────────
         seg_raw = (flight.get("segmentList") or flight.get("segments")
                    or flight.get("legs") or [])
@@ -490,6 +554,8 @@ class PegasusConnectorClient:
             inbound=None,
             airlines=["Pegasus Airlines"],
             owner_airline="PC",
+            conditions=_pc_offer_conditions,
+            bags_price=_pc_offer_bags,
             booking_url=booking_url,
             is_locked=False,
             source="pegasus_direct",

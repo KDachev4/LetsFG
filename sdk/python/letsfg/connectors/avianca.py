@@ -501,6 +501,8 @@ class AviancaConnectorClient:
             offer_id = hashlib.md5(offer_key.encode()).hexdigest()[:12]
             all_airlines = list({s.airline for s in segments})
 
+            conditions, bags_price = self._extract_av_bag_info(best, cur)
+
             offers.append(FlightOffer(
                 id=f"av_{offer_id}",
                 price=price,
@@ -508,12 +510,79 @@ class AviancaConnectorClient:
                 outbound=route,
                 airlines=[("Avianca" if a == "AV" else a) for a in all_airlines],
                 owner_airline="AV",
+                conditions=conditions,
+                bags_price=bags_price,
                 booking_url=self._user_url(req),
                 is_locked=False,
                 source="avianca_direct",
                 source_tier="free",
             ))
         return offers
+
+    @staticmethod
+    def _extract_av_bag_info(ab: dict, currency: str) -> tuple[dict, dict]:
+        """Extract bag allowance from an Avianca airBound entry."""
+        conditions: dict[str, str] = {}
+        bags_price: dict[str, float] = {}
+
+        # Try multiple fare info locations
+        fare_info: dict = {}
+        for key in ("fareDetails", "fareInfo", "fare", "brandInfo"):
+            fi = ab.get(key)
+            if isinstance(fi, dict) and fi:
+                fare_info = fi
+                break
+        if not fare_info:
+            avail = ab.get("availabilities") or []
+            if isinstance(avail, list) and avail and isinstance(avail[0], dict):
+                for key in ("fareInfo", "fareDetails"):
+                    fi = avail[0].get(key)
+                    if isinstance(fi, dict) and fi:
+                        fare_info = fi
+                        break
+
+        fare_name = str(
+            fare_info.get("brandName") or fare_info.get("fareName")
+            or fare_info.get("fareClass") or ab.get("fareFamilyCode")
+            or ab.get("brandCode") or ab.get("fareFamily") or ""
+        )
+        if fare_name:
+            conditions["fare_family"] = fare_name
+
+        bag_allow = (
+            fare_info.get("baggageAllowance") or fare_info.get("baggage")
+            or ab.get("baggageAllowance") or ab.get("baggage") or {}
+        )
+        if isinstance(bag_allow, dict) and bag_allow:
+            qty = (
+                bag_allow.get("quantity") or bag_allow.get("pieces")
+                or bag_allow.get("count") or bag_allow.get("number")
+            )
+            if qty is not None:
+                try:
+                    qty_int = int(qty)
+                    if qty_int == 0:
+                        conditions["checked_bag"] = "no free checked bag (Basic fare)"
+                    else:
+                        weight = bag_allow.get("weight") or bag_allow.get("maxWeight") or 23
+                        conditions["checked_bag"] = f"{qty_int}x {weight}kg bag included"
+                        bags_price["checked_bag"] = 0.0
+                except (TypeError, ValueError):
+                    pass
+
+        # Fallback: infer from fare name
+        if "checked_bag" not in conditions and fare_name:
+            name_upper = fare_name.upper()
+            if any(k in name_upper for k in ("BASIC", "LIGHT", "BASE", "PROMO", "MINI")):
+                conditions["checked_bag"] = "no free checked bag (Basic fare)"
+            elif any(k in name_upper for k in ("CLASSIC", "ECONOMY", "STANDARD", "REGULAR")):
+                conditions["checked_bag"] = "1x 23kg bag included"
+                bags_price["checked_bag"] = 0.0
+            elif any(k in name_upper for k in ("FLEX", "BUSINESS", "PLUS", "PREMIUM", "EJECUTIVO")):
+                conditions["checked_bag"] = "2x 23kg bags included"
+                bags_price["checked_bag"] = 0.0
+
+        return conditions, bags_price
 
     def _extract_segments(self, flight: dict, req: FlightSearchRequest) -> list[FlightSegment]:
         segments: list[FlightSegment] = []

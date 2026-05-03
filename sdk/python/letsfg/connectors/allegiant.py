@@ -61,6 +61,9 @@ _TIMEZONES = [
 _MAX_ATTEMPTS = 3
 _GQL_WAIT = 20  # seconds to wait for flights GQL per attempt (comes in 4-8s when it works)
 
+_ancillary_cache: dict[str, tuple[float, dict]] = {}
+_ANCILLARY_CACHE_TTL = 1800
+
 # ── GraphQL query (captured from allegiantair.com booking page) ──────
 
 _FLIGHTS_GQL = """query flights($flightSearchCriteria: FlightSearchCriteriaInput!) {
@@ -310,6 +313,24 @@ class AllegiantConnectorClient:
             if ib_result.total_results > 0:
                 ob_result.offers = self._combine_rt(ob_result.offers, ib_result.offers, req)
                 ob_result.total_results = len(ob_result.offers)
+        if ob_result.offers:
+            segs = ob_result.offers[0].outbound.segments if ob_result.offers[0].outbound else []
+            anc_origin = segs[0].origin if segs else req.origin
+            anc_dest = segs[-1].destination if segs else req.destination
+            try:
+                ancillary = await asyncio.wait_for(
+                    self._fetch_ancillaries(
+                        anc_origin, anc_dest,
+                        req.date_from.isoformat(), req.adults, ob_result.currency,
+                    ),
+                    timeout=15.0,
+                )
+                if ancillary:
+                    self._apply_ancillaries(ob_result.offers, ancillary)
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("G4: ancillary fetch timed out")
+            except Exception as _anc_err:
+                logger.debug("G4: ancillary fetch error: %s", _anc_err)
         return ob_result
 
 
@@ -623,6 +644,61 @@ class AllegiantConnectorClient:
             total_results=len(offers),
         )
 
+
+    # ------------------------------------------------------------------
+    # Ancillary pricing
+    # ------------------------------------------------------------------
+
+    async def _fetch_ancillaries(
+        self,
+        origin: str,
+        dest: str,
+        date_str: str,
+        adults: int,
+        currency: str,
+    ) -> dict | None:
+        cache_key = f"g4_{origin}_{dest}_{date_str}"
+        now = time.time()
+        if cache_key in _ancillary_cache:
+            ts, cached = _ancillary_cache[cache_key]
+            if now - ts < _ANCILLARY_CACHE_TTL:
+                return cached
+        # Allegiant: all fares are pay-per-bag. Carry-on from ~$10–$25 if
+        # purchased at booking (much more at the gate or day-of).
+        result: dict = {
+            "carry_on_from": 10.0,
+            "carry_on_note": "carry-on from +USD 10 (add at booking — cheaper than airport prices)",
+            "checked_from": 10.0,
+            "checked_note": "first checked bag from +USD 10 (add at booking)",
+            "seat_from": 5.0,
+            "seat_note": "seat selection from +USD 5",
+            "currency": "USD",
+        }
+        _ancillary_cache[cache_key] = (now, result)
+        return result
+
+    def _apply_ancillaries(self, offers: list, ancillary: dict) -> None:
+        carry_on_from = ancillary.get("carry_on_from")
+        carry_on_note = ancillary.get("carry_on_note")
+        checked_from = ancillary.get("checked_from")
+        checked_note = ancillary.get("checked_note")
+        seat_from = ancillary.get("seat_from")
+        seat_note = ancillary.get("seat_note")
+        anc_currency = ancillary.get("currency", "USD")
+        for offer in offers:
+            ccy_ok = offer.currency.upper() == anc_currency.upper()
+            if carry_on_note:
+                offer.conditions["carry_on"] = carry_on_note
+            if checked_note:
+                offer.conditions["checked_bag"] = checked_note
+            if seat_note:
+                offer.conditions["seat"] = seat_note
+            if carry_on_from is not None and (carry_on_from == 0.0 or ccy_ok):
+                offer.bags_price["carry_on"] = carry_on_from
+            if checked_from is not None and (checked_from == 0.0 or ccy_ok):
+                offer.bags_price["checked_bag"] = checked_from
+            if seat_from is not None and (seat_from == 0.0 or ccy_ok):
+                offer.bags_price["seat_selection"] = seat_from
 
     @staticmethod
     def _combine_rt(

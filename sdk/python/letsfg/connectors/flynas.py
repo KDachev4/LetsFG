@@ -466,6 +466,8 @@ class FlynasConnectorClient:
                         inbound=rt["route"],
                         airlines=["flynas"],
                         owner_airline="XY",
+                        conditions=ob.get("conditions", {}),
+                        bags_price=ob.get("bags_price", {}),
                         booking_url=booking_url,
                         is_locked=False,
                         source="flynas_direct",
@@ -483,6 +485,8 @@ class FlynasConnectorClient:
                     inbound=None,
                     airlines=["flynas"],
                     owner_airline="XY",
+                    conditions=ob.get("conditions", {}),
+                    bags_price=ob.get("bags_price", {}),
                     booking_url=booking_url,
                     is_locked=False,
                     source="flynas_direct",
@@ -515,6 +519,43 @@ class FlynasConnectorClient:
         """Parse a single flight from the flynas FlightSearch response."""
         best_price = None
         fares = flight.get("fares", [])
+
+        # ── Build fare name → price map for bag add-on detection ──
+        _fare_price_map: dict[str, float] = {}
+        _fare_bag_kg: dict[str, int] = {}
+        _XY_NO_BAG = {"light", "eco", "lite", "promo", "value", "basic_light"}
+        _XY_BAG = {"standard", "basic", "flex", "flexi", "plus", "comfort", "advantage"}
+        for fare in fares:
+            if not isinstance(fare, dict):
+                continue
+            p = fare.get("price")
+            if p is None or p <= 0:
+                continue
+            fname = (
+                fare.get("fareName") or fare.get("fareType") or
+                fare.get("fareCode") or fare.get("bundleName") or ""
+            ).lower().strip()
+            if fname and fname not in _fare_price_map:
+                _fare_price_map[fname] = float(p)
+            # Extract baggage kg if available
+            ba = fare.get("baggageAllowance") or fare.get("baggage") or {}
+            if isinstance(ba, dict):
+                kg = (ba.get("checkedBaggageWeight") or ba.get("checked") or
+                      ba.get("weight") or ba.get("kg") or 0)
+                try:
+                    _fare_bag_kg[fname] = int(float(kg))
+                except (TypeError, ValueError):
+                    pass
+            # Also look at direct weight fields
+            for wk in ("checkedBaggageWeight", "checked_baggage_kg", "baggageKg", "bagKg"):
+                wv = fare.get(wk)
+                if wv and fname:
+                    try:
+                        _fare_bag_kg[fname] = int(float(wv))
+                    except (TypeError, ValueError):
+                        pass
+                    break
+
         for fare in fares:
             p = fare.get("price")
             if p is not None and p > 0:
@@ -577,10 +618,41 @@ class FlynasConnectorClient:
             or f"{segments[0].flight_no}_{segments[0].departure.isoformat()}"
         )
 
+        # ── Bag add-on from fare families ────────────────────────────
+        _xy_base_price: float | None = None
+        _xy_bag_price: float | None = None
+        _xy_bag_kg = 23  # flynas default checked bag weight
+        for bname, bprice in _fare_price_map.items():
+            if any(n in bname for n in _XY_NO_BAG):
+                if _xy_base_price is None or bprice < _xy_base_price:
+                    _xy_base_price = bprice
+            elif any(n in bname for n in _XY_BAG):
+                if _xy_bag_price is None or bprice < _xy_bag_price:
+                    _xy_bag_price = bprice
+                    _xy_bag_kg = _fare_bag_kg.get(bname, 23)
+
+        _xy_conditions: dict[str, str] = {}
+        _xy_bags: dict = {}
+        if _xy_base_price is not None and _xy_bag_price is not None:
+            _add_on = round(_xy_bag_price - _xy_base_price, 2)
+            if _add_on > 0:
+                _xy_bags["checked"] = _add_on
+                _xy_conditions["checked_bag"] = "not included (Light fare)"
+                _xy_conditions["carry_on"] = (
+                    f"checked bag ({_xy_bag_kg} kg) from +{_add_on:.2f} SAR"
+                )
+        elif _xy_bag_price is not None and _xy_base_price is None:
+            _xy_conditions["checked_bag"] = f"{_xy_bag_kg} kg included"
+            _xy_bags["checked"] = 0.0
+
+        _xy_conditions["seat"] = "seat selection add-on from ~30 SAR"
+
         return {
-            "price": float(best_price),
+            "price": best_price,
             "key": flight_key,
             "route": route,
+            "conditions": _xy_conditions,
+            "bags_price": _xy_bags,
         }
 
     @staticmethod

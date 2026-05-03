@@ -451,15 +451,19 @@ class GolConnectorClient:
         # Find cheapest fare (LI = Light is typically cheapest)
         best_price = float("inf")
         best_currency = "BRL"
+        cheapest_fare: dict = {}
         for fare in fare_family:
             price_info = fare.get("price", {})
             total = price_info.get("total")
             if total is not None and 0 < total < best_price:
                 best_price = total
                 best_currency = price_info.get("currency", "BRL")
+                cheapest_fare = fare
 
         if best_price == float("inf") or best_price <= 0:
             return None
+
+        conditions, bags_price = self._extract_gol_bag_info(cheapest_fare, best_currency)
 
         # Map cabin code to cabin name for segment
         _g3_cabin_name = {"M": "economy", "W": "economy", "C": "business", "F": "business"}.get(req.cabin_class or "M", "economy")
@@ -503,11 +507,93 @@ class GolConnectorClient:
             inbound=route if is_return else None,
             airlines=list(set(s.airline for s in segments)),
             owner_airline="G3",
+            conditions=conditions,
+            bags_price=bags_price,
             booking_url=booking_url,
             is_locked=False,
             source="gol_direct",
             source_tier="protocol",
         )
+
+    @staticmethod
+    def _extract_gol_bag_info(fare: dict, currency: str) -> tuple[dict, dict]:
+        """Extract bag allowance from a GOL fareFamily entry."""
+        conditions: dict[str, str] = {}
+        bags_price: dict[str, float] = {}
+        if not fare:
+            return conditions, bags_price
+
+        fare_name = str(fare.get("name") or fare.get("code") or fare.get("fareCode") or "")
+        if fare_name:
+            conditions["fare_family"] = fare_name
+
+        # Try structured bag allowance field (several possible names)
+        bag_allow = (
+            fare.get("baggageAllowance")
+            or fare.get("baggage")
+            or fare.get("checkedBaggage")
+            or fare.get("luggageAllowance")
+            or {}
+        )
+        if isinstance(bag_allow, dict):
+            qty = (
+                bag_allow.get("quantity") or bag_allow.get("pieces")
+                or bag_allow.get("count") or bag_allow.get("numberOfBags")
+            )
+            weight = bag_allow.get("weight") or bag_allow.get("maxWeight") or 23
+            try:
+                qty_int = int(qty) if qty is not None else -1
+            except (TypeError, ValueError):
+                qty_int = -1
+
+            if qty_int == 0:
+                conditions["checked_bag"] = "no free checked bag"
+                add_bag = (
+                    fare.get("additionalBaggage")
+                    or fare.get("extraBaggage")
+                    or fare.get("upgradeBaggage")
+                    or {}
+                )
+                if isinstance(add_bag, dict):
+                    add_price = (
+                        add_bag.get("totalAmount") or add_bag.get("amount")
+                        or (add_bag.get("price") or {}).get("total")
+                    )
+                    if add_price:
+                        try:
+                            p = float(add_price)
+                            bags_price["checked_bag"] = p
+                            conditions["checked_bag"] += f"; add-on from +{currency} {p:.0f}"
+                        except (TypeError, ValueError):
+                            pass
+            elif qty_int > 0:
+                conditions["checked_bag"] = f"{qty_int}x {weight}kg bag included"
+                bags_price["checked_bag"] = 0.0
+        elif isinstance(bag_allow, (int, float)):
+            qty_int = int(bag_allow)
+            if qty_int == 0:
+                conditions["checked_bag"] = "no free checked bag"
+            else:
+                conditions["checked_bag"] = f"{qty_int}x bag included"
+                bags_price["checked_bag"] = 0.0
+
+        # Fallback: infer from GOL fare family name
+        if "checked_bag" not in conditions and fare_name:
+            name_upper = fare_name.upper()
+            if "LIGHT" in name_upper or name_upper in ("LI", "LITE", "PROMO"):
+                conditions["checked_bag"] = "no free checked bag (Light/Promo fare)"
+            elif name_upper in ("SMART", "SM", "PLUS", "PL", "EC", "REGULAR") or any(
+                k in name_upper for k in ("SMART", "PLUS", "REGULAR", "ECONOMY")
+            ):
+                conditions["checked_bag"] = "1x 23kg bag included"
+                bags_price["checked_bag"] = 0.0
+            elif name_upper in ("MAX", "MX", "TOP", "PREMIUM") or any(
+                k in name_upper for k in ("MAX", "TOP", "PREMIUM", "EXECUTIVO")
+            ):
+                conditions["checked_bag"] = "2x 23kg bags included"
+                bags_price["checked_bag"] = 0.0
+
+        return conditions, bags_price
 
     def _build_response(
         self, offers: list[FlightOffer], req: FlightSearchRequest, elapsed: float

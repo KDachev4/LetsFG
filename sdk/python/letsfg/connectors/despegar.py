@@ -77,6 +77,48 @@ def _parse_datetime(dt_str: Any) -> Optional[datetime]:
         return None
 
 
+def _extract_despegar_bag_info(bag_info: dict, ancillaries: list, currency: str) -> tuple[dict, dict]:
+    """Extract bag allowance from Despegar item bag/ancillary data."""
+    conditions: dict[str, str] = {}
+    bags_price: dict[str, float] = {}
+
+    if isinstance(bag_info, dict) and bag_info:
+        qty = (
+            bag_info.get("quantity") or bag_info.get("pieces")
+            or bag_info.get("count") or bag_info.get("number")
+        )
+        if qty is not None:
+            try:
+                qty_int = int(qty)
+                if qty_int == 0:
+                    conditions["checked_bag"] = "no free checked bag"
+                else:
+                    weight = bag_info.get("weight") or bag_info.get("maxWeight") or 23
+                    conditions["checked_bag"] = f"{qty_int}x {weight}kg bag included"
+                    bags_price["checked_bag"] = 0.0
+            except (TypeError, ValueError):
+                pass
+
+    if isinstance(ancillaries, list):
+        for anc in ancillaries:
+            if not isinstance(anc, dict):
+                continue
+            anc_type = str(anc.get("type") or anc.get("code") or "").upper()
+            if any(k in anc_type for k in ("BAG", "LUGGAGE", "BAGGAGE", "CHECKED")):
+                price_field = anc.get("price") or anc.get("amount") or anc.get("cost") or {}
+                p = price_field.get("total") or price_field.get("amount") if isinstance(price_field, dict) else price_field
+                if p:
+                    try:
+                        p_f = float(p)
+                        if "checked_bag" not in conditions:
+                            bags_price["checked_bag"] = p_f
+                            conditions["checked_bag"] = f"bag add-on from +{currency} {p_f:.0f}"
+                    except (TypeError, ValueError):
+                        pass
+
+    return conditions, bags_price
+
+
 class DespegarConnectorClient:
     """Despegar OTA — Playwright browser + API interception."""
 
@@ -288,6 +330,20 @@ class DespegarConnectorClient:
                 if price <= 0:
                     continue
 
+                # Extract bag allowance from item/priceDetail
+                bag_info = (
+                    item.get("baggageAllowance")
+                    or price_detail.get("baggage")
+                    or price_detail.get("baggageAllowance")
+                    or {}
+                )
+                ancillaries = (
+                    price_detail.get("ancillaries")
+                    or item.get("ancillaries")
+                    or []
+                )
+                conditions, bags_price = _extract_despegar_bag_info(bag_info, ancillaries, currency)
+
                 # Get route info
                 route_choices = item.get("routeChoices", [])
                 if not route_choices:
@@ -368,6 +424,8 @@ class DespegarConnectorClient:
                     inbound=None,
                     airlines=airline_names,
                     owner_airline=validating,
+                    conditions=conditions,
+                    bags_price=bags_price,
                     booking_url=f"https://www.despegar.com.ar/shop/flights/results/oneway/{req.origin}/{req.destination}/{date_str}/{req.adults or 1}/0/0",
                     is_locked=False,
                     source="despegar_ota",
