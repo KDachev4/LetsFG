@@ -272,15 +272,19 @@ _AIRLINE_ANCILLARY: dict[str, dict[str, Any]] = {
         "seat": 250.0, "currency": "INR",
     },
     "SG": {  # SpiceJet
-        "carry_on": 0.0, "carry_on_kg": 7, "checked_bag": 1200.0, "checked_bag_kg": 15,
+        "carry_on": 0.0, "carry_on_kg": 7,
+        "checked_bag": 0.0, "checked_bag_kg": 15,
+        "checked_bag_note": "1 checked bag (15 kg) included",
         "seat": 200.0, "currency": "INR",
     },
     "QP": {  # Akasa Air
-        "carry_on": 0.0, "carry_on_kg": 7, "checked_bag": 900.0, "checked_bag_kg": 15,
+        "carry_on": 0.0, "carry_on_kg": 7,
+        "checked_bag": 0.0, "checked_bag_kg": 15,
+        "checked_bag_note": "1 checked bag (15 kg) included",
         "seat": 200.0, "currency": "INR",
     },
     "IX": {  # Air India Express
-        "carry_on": 0.0, "carry_on_kg": 7, "checked_bag": 900.0, "checked_bag_kg": 15,
+        "carry_on": 0.0, "carry_on_kg": 7, "checked_bag": 1500.0, "checked_bag_kg": 15,
         "seat": 250.0, "currency": "INR",
     },
     "VJ": {  # VietJet
@@ -332,7 +336,7 @@ _AIRLINE_ANCILLARY: dict[str, dict[str, Any]] = {
         "seat": 25.0, "currency": "CNY",
     },
     "DD": {  # Nok Air
-        "carry_on": 0.0, "carry_on_kg": 7, "checked_bag": 400.0, "checked_bag_kg": 20,
+        "carry_on": 0.0, "carry_on_kg": 7, "checked_bag": 600.0, "checked_bag_kg": 20,
         "seat": 100.0, "currency": "THB",
     },
     "SL": {  # Thai Lion Air
@@ -340,11 +344,15 @@ _AIRLINE_ANCILLARY: dict[str, dict[str, Any]] = {
         "seat": 100.0, "currency": "THB",
     },
     "JT": {  # Lion Air
-        "carry_on": 200000.0, "carry_on_kg": 7, "checked_bag": 200000.0, "checked_bag_kg": 20,
+        "carry_on": 0.0, "carry_on_kg": 7,
+        "carry_on_note": "1 cabin bag (7 kg) included",
+        "checked_bag": 100000.0, "checked_bag_kg": 20,
         "seat": 50000.0, "currency": "IDR",
     },
     "ID": {  # Batik Air
-        "carry_on": 200000.0, "carry_on_kg": 7, "checked_bag": 200000.0, "checked_bag_kg": 20,
+        "carry_on": 0.0, "carry_on_kg": 7,
+        "carry_on_note": "1 cabin bag (7 kg) included",
+        "checked_bag": 150000.0, "checked_bag_kg": 20,
         "seat": 50000.0, "currency": "IDR",
     },
     "QG": {  # Citilink (Indonesia)
@@ -379,7 +387,7 @@ _AIRLINE_ANCILLARY: dict[str, dict[str, Any]] = {
     },
     "ZG": {  # Zipair
         "carry_on": 0.0, "carry_on_kg": 7, "checked_bag": 3000.0, "checked_bag_kg": 20,
-        "seat": 0.0, "currency": "JPY",
+        "seat": 500.0, "currency": "JPY",
     },
     "JX": {  # Starlux Airlines — bags included
         "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 0.0, "checked_bag_kg": 23,
@@ -391,10 +399,7 @@ _AIRLINE_ANCILLARY: dict[str, dict[str, Any]] = {
         "carry_on": None, "checked_bag": None, "checked_bag_kg": 23,
         "seat": 10.0, "currency": "USD",
     },
-    "NK": {  # Spirit Airlines — all add-on fees highly variable
-        "carry_on": None, "checked_bag": None, "checked_bag_kg": 23,
-        "seat": 10.0, "currency": "USD",
-    },
+    # NK (Spirit Airlines) removed — carrier shut down May 2, 2026
     "G4": {  # Allegiant Air — variable pricing
         "carry_on": None, "checked_bag": None, "checked_bag_kg": 23,
         "seat": 12.0, "currency": "USD",
@@ -520,20 +525,20 @@ _AIRLINE_ANCILLARY: dict[str, dict[str, Any]] = {
     },
 
     # ── European FSCs ──────────────────────────────────────────────────────
-    "LH": {  # Lufthansa (Light fare has no bag)
-        "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 30.0, "checked_bag_kg": 23,
+    "LH": {  # Lufthansa — Light fare: bag from EUR 35 add-on; Classic/Flex: 1×23 kg included
+        "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 35.0, "checked_bag_kg": 23,
         "seat": 10.0, "currency": "EUR",
     },
-    "OS": {  # Austrian Airlines
-        "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 30.0, "checked_bag_kg": 23,
+    "OS": {  # Austrian Airlines — same fare family structure as LH
+        "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 35.0, "checked_bag_kg": 23,
         "seat": 10.0, "currency": "EUR",
     },
-    "SN": {  # Brussels Airlines
-        "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 30.0, "checked_bag_kg": 23,
+    "SN": {  # Brussels Airlines — same fare family structure as LH
+        "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 35.0, "checked_bag_kg": 23,
         "seat": 10.0, "currency": "EUR",
     },
-    "LX": {  # Swiss International
-        "carry_on": 0.0, "carry_on_kg": 10, "checked_bag": 30.0, "checked_bag_kg": 23,
+    "LX": {  # Swiss International — Light fare: bag from CHF 40; Economy/Flex: included
+        "carry_on": 0.0, "carry_on_kg": 8, "checked_bag": 40.0, "checked_bag_kg": 23,
         "seat": 12.0, "currency": "CHF",
     },
     "AF": {  # Air France
@@ -954,11 +959,12 @@ def apply_ref_ancillaries(offer: Any) -> None:  # offer: FlightOffer (avoid circ
                 note = f"1 cabin bag included{kg_str}"
             else:
                 kg_str = f", {kg} kg" if kg else ""
-                note = f"cabin bag add-on from ~{val:.0f} {curr}{kg_str}"
+                note = f"cabin bag: add-on (price varies by route{kg_str})"
         offer.conditions["carry_on"] = note
-        # Numeric for downstream aggregation
-        if "carry_on" not in offer.bags_price and ref.get("carry_on") is not None:
-            offer.bags_price["carry_on"] = ref["carry_on"]
+        # Only mark as 0.0 (included free) — non-zero static estimates must NOT
+        # go into bags_price because they are not real per-flight prices.
+        if "carry_on" not in offer.bags_price and ref.get("carry_on") == 0.0:
+            offer.bags_price["carry_on"] = 0.0
 
     # ── Checked bag ─────────────────────────────────────────────────────────
     if "checked_bag" not in offer.conditions:
@@ -971,10 +977,10 @@ def apply_ref_ancillaries(offer: Any) -> None:  # offer: FlightOffer (avoid circ
             elif val == 0.0:
                 note = f"1 checked bag ({kg} kg) included"
             else:
-                note = f"checked bag add-on from ~{val:.0f} {curr} ({kg} kg)"
+                note = f"checked bag: add-on (price varies by route, {kg} kg)"
         offer.conditions["checked_bag"] = note
-        if "checked_bag" not in offer.bags_price and ref.get("checked_bag") is not None:
-            offer.bags_price["checked_bag"] = ref["checked_bag"]
+        if "checked_bag" not in offer.bags_price and ref.get("checked_bag") == 0.0:
+            offer.bags_price["checked_bag"] = 0.0
 
     # ── Seat selection ───────────────────────────────────────────────────────
     if "seat" not in offer.conditions:
@@ -984,7 +990,7 @@ def apply_ref_ancillaries(offer: Any) -> None:  # offer: FlightOffer (avoid circ
         elif val == 0.0:
             note = "seat selection: free (assigned at check-in)"
         else:
-            note = f"seat selection: from ~{val:.0f} {curr}"
+            note = "seat selection: add-on (price varies by route)"
         offer.conditions["seat"] = note
-        if "seat_selection" not in offer.bags_price and val is not None:
-            offer.bags_price["seat_selection"] = val
+        if "seat_selection" not in offer.bags_price and val == 0.0:
+            offer.bags_price["seat_selection"] = 0.0
